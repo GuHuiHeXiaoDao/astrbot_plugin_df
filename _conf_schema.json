@@ -1,0 +1,39 @@
+{
+  "pack_dir": {
+    "description": "内容包根目录（含 entries/ 与 assets/）",
+    "type": "string",
+    "default": "./packs/df"
+  },
+  "wiki_mode": {
+    "description": "选择Wiki来源",
+    "type": "select",
+    "options": ["mediawiki", "wikipedia", "fandom"],
+    "default": "mediawiki"
+  },
+  "wiki_lang": {
+    "description": "Wikipedia语言（仅 wikipedia 模式使用）",
+    "type": "select",
+    "options": ["en", "zh", "ja"],
+    "default": "en"
+  },
+  "mw_host": {
+    "description": "MediaWiki 主机（DF：dwarffortresswiki.org）",
+    "type": "string",
+    "default": "dwarffortresswiki.org"
+  },
+  "mw_https": {
+    "description": "MediaWiki 是否 HTTPS",
+    "type": "bool",
+    "default": true
+  },
+  "mw_path_prefix": {
+    "description": "MediaWiki API 前缀（一般留空；例如 'w/'）",
+    "type": "string",
+    "default": ""
+  },
+  "wiki_limit": {
+    "description": "搜索返回条数上限",
+    "type": "integer",
+    "default": 3
+  }
+}
