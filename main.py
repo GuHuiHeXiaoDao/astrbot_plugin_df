@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-AstrBot 插件：Dwarf Fortress 攻略（可插入“图+文”模块）
-- 唤醒词：/df, /df.wiki, /df.kb, /dfcfg, /df.sync, /df.list
-- 优先命中“内容包”模块（Markdown+YAML 前言），允许你自由插入**文字与图片**并保持顺序；
-- 未命中再查 KB（JSON）与 Wiki（MediaWiki / Wikipedia / Fandom）；
-- 提供 /df.sync 热加载，无需重启 AstrBot；
-- 提供 LLM 工具：kb_lookup / wiki_search（供模型自行决策）。
-"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,20 +24,13 @@ def _load_json(path: str, default: Any):
     except Exception:
         return default
 
-# ---------------------- 内容包（Markdown+YAML） ----------------------
 class ContentEntry:
     def __init__(self, key: str, aliases: List[str], blocks: List[Dict[str, Any]]):
         self.key = key
         self.aliases = aliases or []
-        self.blocks = blocks  # [{type: text|image, content|src}] 顺序保留
+        self.blocks = blocks
 
 class ContentPack:
-    """
-    目录结构（默认 packs/df/entries/）：
-    - entries/*.md  # Markdown，支持 YAML 前言 + 正文中图片语法
-    - assets/...    # 可选，放本地图；在 md 里用相对路径引用
-    也支持 entries/*.json （blocks 序列）。
-    """
     def __init__(self, pack_dir: str):
         self.pack_dir = pack_dir
         self.entries_dir = os.path.join(pack_dir, "entries")
@@ -77,42 +62,37 @@ class ContentPack:
                 if entry:
                     k = self._norm(entry.key)
                     self.by_key[k] = entry
-                    # 自身名与别名映射
                     self.alias[k] = k
                     for a in entry.aliases:
                         self.alias[self._norm(a)] = k
             except Exception as e:
                 logger.error(f"Load entry failed: {path} -> {e}")
 
-    def _split_front_matter(self, text: str) -> Tuple[Dict[str, Any], str]:
+    def _split_front_matter(self, text: str):
         if text.startswith("---"):
+            import re, yaml
             m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
             if m:
-                front = yaml.safe_load(m.group(1)) or {}
+                try:
+                    front = yaml.safe_load(m.group(1)) or {}
+                except Exception:
+                    front = {}
                 body = m.group(2)
                 return front, body
         return {}, text
 
     def _parse_md_blocks(self, body: str) -> List[Dict[str, Any]]:
-        """
-        将 markdown 文本按图片语法切分为 blocks，保持顺序：
-        文本(Text) / 图片(Image) / 文本 / ...
-        支持语法：![](src) 或 ![alt](src)；其余 markdown 保留为纯文本。
-        """
         blocks: List[Dict[str, Any]] = []
         pos = 0
         pattern = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
         for m in pattern.finditer(body):
             start, end = m.span()
             img_src = m.group(1).strip()
-            # 前面的文本
             txt = body[pos:start].strip()
             if txt:
                 blocks.append({"type": "text", "content": txt})
-            # 图片块
             blocks.append({"type": "image", "src": img_src})
             pos = end
-        # 收尾文本
         tail = body[pos:].strip()
         if tail:
             blocks.append({"type": "text", "content": tail})
@@ -125,10 +105,8 @@ class ContentPack:
         key = meta.get("key") or os.path.splitext(os.path.basename(path))[0]
         aliases = meta.get("aliases") or []
         blocks = self._parse_md_blocks(body)
-        # 追加 frontmatter 中的 images
-        images = meta.get("images") or []
-        for src in images:
-            blocks.append({"type": "image", "src": src})
+        for src in (meta.get("images") or []):
+            blocks.append({"type": "image", "src": str(src)})
         return ContentEntry(key=key, aliases=aliases, blocks=blocks)
 
     def _load_json_entry(self, path: str) -> Optional[ContentEntry]:
@@ -146,7 +124,6 @@ class ContentPack:
             return self.by_key.get(self.alias[k])
         return None
 
-    # 将 entry 渲染为 AstrBot 消息链（图+文）
     def render_chain(self, entry: ContentEntry) -> List[Any]:
         chain: List[Any] = []
         for blk in entry.blocks:
@@ -161,7 +138,6 @@ class ContentPack:
                 if src.startswith("http://") or src.startswith("https://"):
                     chain.append(Comp.Image.fromURL(src))
                 else:
-                    # 相对路径：优先相对于 entries，同级 assets 目录也支持
                     abs1 = os.path.join(self.entries_dir, src)
                     abs2 = os.path.join(self.assets_dir, src)
                     abs3 = os.path.join(self.pack_dir, src)
@@ -173,7 +149,6 @@ class ContentPack:
                         chain.append(Comp.Plain(f"[提示] 找不到本地图片：{src}"))
         return chain
 
-# ---------------------- 关键字 KB（兼容） ----------------------
 class KeywordKB:
     def __init__(self, kb_path: str):
         self.kb_path = kb_path
@@ -188,7 +163,6 @@ class KeywordKB:
         k = self.normalize(key)
         return self.entries.get(k)
 
-# ---------------------- Wiki 客户端 ----------------------
 class WikiClient:
     def __init__(self, mode: str = "mediawiki", lang: str = "en",
                  fandom_site: str = "", mw_host: str = "dwarffortresswiki.org",
@@ -218,7 +192,6 @@ class WikiClient:
         else:
             return self._mediawiki_summary(title)
 
-    # Wikipedia
     def _wp_base(self):
         return f"https://{self.lang}.wikipedia.org/w/api.php"
     def _search_wikipedia(self, query: str, limit: int = 3):
@@ -241,7 +214,6 @@ class WikiClient:
             return extract[:900], url
         return "", f"https://{self.lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
 
-    # Fandom
     def _fd_host(self):
         host = (self.fandom_site or "www") + ".fandom.com"
         return f"https://{host}/api.php", host
@@ -267,7 +239,6 @@ class WikiClient:
             return extract[:900], url
         return "", f"https://{host}/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
 
-    # MediaWiki
     def _mw_base(self):
         scheme = "https" if self.mw_https else "http"
         host = self.mw_host or "www.example.com"
@@ -294,7 +265,6 @@ class WikiClient:
             return extract[:900], url
         return "", url
 
-# ---------------------- LLM 工具 ----------------------
 @dataclass
 class KBLookupTool(FunctionTool):
     name: str = "kb_lookup"
@@ -302,7 +272,7 @@ class KBLookupTool(FunctionTool):
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
         "properties": {
-            "keyword": {"type": "string", "description": "关键词（例如：水壶 / waterskin）"}
+            "keyword": {"type": "string", "description": "关键词"}
         },
         "required": ["keyword"]
     })
@@ -312,36 +282,30 @@ class KBLookupTool(FunctionTool):
         star = self.star_ref
         if not star:
             return {"found": False}
-        # 先 content pack
         entry = star.pack.match(keyword)
         if entry:
-            # 返回文本合并与图片 URL/本地路径（供模型使用文本回答，图片以链接形式给出）
             texts = [blk["content"] for blk in entry.blocks if blk.get("type")=="text"]
             images = []
             for blk in entry.blocks:
                 if blk.get("type")=="image":
-                    src = blk.get("src","")
-                    if src.startswith("http"):
-                        images.append(src)
-                    else:
-                        images.append(src)  # 相对路径，交给调用方处理
+                    images.append(blk.get("src",""))
             return {"found": True, "text": "\n\n".join(texts), "images": images}
-        # 再 KB
         doc = star.kb.lookup(keyword)
         if doc:
-            return {"found": True, "text": doc.get("answer",""), "images": [doc.get("image","")] if doc.get("image") else []}
+            imgs = [doc.get("image"," ") .strip()] if doc.get("image") else []
+            return {"found": True, "text": doc.get("answer",""), "images": imgs}
         return {"found": False}
 
 @dataclass
 class WikiSearchTool(FunctionTool):
     name: str = "wiki_search"
-    description: str = "Wiki 搜索并返回摘要（支持 MediaWiki/Wikipedia/Fandom）。"
+    description: str = "Wiki 搜索并返回摘要。"
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "搜索关键词"},
             "title": {"type": "string", "description": "已知标题（可选）"},
-            "limit": {"type": "integer", "description": "返回条目数（默认 3）"}
+            "limit": {"type": "int", "description": "返回条数（默认3）"}
         },
         "required": ["query"]
     })
@@ -360,39 +324,36 @@ class WikiSearchTool(FunctionTool):
             if not items:
                 return {"ok": True, "results": []}
             first = items[0]
-            summary, url = wiki.page_summary(first["title"])
+            summary, url = wiki.page_summary(first["title"]
+            )
             first["summary"] = summary
             first["url"] = url
             return {"ok": True, "results": [first] + items[1:]}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-# ---------------------- 插件主体 ----------------------
-@register("astrbot_plugin_gameguide", "your_name", "DF 攻略：内容包(文+图)+KB+Wiki+LLM", "1.2.0")
+@register("astrbot_plugin_df", "your_name", "DF 攻略（内容包+KB+Wiki+LLM）", "1.2.1")
 class GameGuide(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or AstrBotConfig({})
 
-        # 内容包目录（默认 packs/df）
         pack_dir = self.config.get("pack_dir", _abspath("packs", "df"))
         self.pack = ContentPack(pack_dir)
 
-        # 兼容旧 KB（可不使用）
         kb_path = _abspath("kb", "keywords.json")
         self.kb = KeywordKB(kb_path)
 
-        # Wiki 默认 DF
         self.wiki = WikiClient(
             mode=self.config.get("wiki_mode","mediawiki"),
             lang=self.config.get("wiki_lang","en"),
             fandom_site=self.config.get("fandom_site",""),
             mw_host=self.config.get("mw_host","dwarffortresswiki.org"),
             mw_https=bool(self.config.get("mw_https", True)),
-            mw_path_prefix=self.config.get("mw_path_prefix","")
+            mw_path_prefix=self.config.get("mw_path_prefix",""
+            )
         )
 
-        # LLM 工具
         self.kb_tool = KBLookupTool(star_ref=self)
         self.wiki_tool = WikiSearchTool(star_ref=self)
         try:
@@ -404,31 +365,27 @@ class GameGuide(Star):
             except Exception as e2:
                 logger.warn(f"LLM tools registration failed: {e2}")
 
-    # /df —— 优先命中内容包
     @filter.command("df", alias=["攻略", "game", "guide"])
     async def cmd_df(self, event: AstrMessageEvent):
         q = event.message_str.strip().split(maxsplit=1)
         if len(q) < 2 or not q[1].strip():
-            yield event.plain_result("用法：/df <关键词>  （命中内容包→直接输出图+文；否则查 KB→Wiki）")
+            yield event.plain_result("用法：/df <关键词>  （内容包→KB→Wiki）")
             return
         keyword = q[1].strip()
 
-        # 1) 内容包
         entry = self.pack.match(keyword)
         if entry:
             chain = self.pack.render_chain(entry)
-            if not chain:
-                chain = [Comp.Plain("该条目没有内容。")]
-            yield event.chain_result(chain)
+            yield event.chain_result(chain if chain else [Comp.Plain("该条目没有内容。")])
             return
 
-        # 2) 旧 KB
         doc = self.kb.lookup(keyword)
         if doc:
             chain = []
-            if doc.get("answer"):
-                chain.append(Comp.Plain(doc["answer"]))
-            img = doc.get("image","")
+            ans = (doc.get("answer") or "").strip()
+            if ans:
+                chain.append(Comp.Plain(ans))
+            img = (doc.get("image") or "").strip()
             if img:
                 if img.startswith("http"):
                     chain.append(Comp.Image.fromURL(img))
@@ -439,10 +396,8 @@ class GameGuide(Star):
             yield event.chain_result(chain) if chain else event.plain_result("KB 命中但无内容。")
             return
 
-        # 3) Wiki
         try:
-            limit = int(self.config.get("wiki_limit", 3))
-            items = self.wiki.search(keyword, limit=limit)
+            items = self.wiki.search(keyword, limit=int(self.config.get("wiki_limit", 3)))
             if not items:
                 yield event.plain_result("未找到相关条目。")
                 return
@@ -450,10 +405,8 @@ class GameGuide(Star):
             summary, url = self.wiki.page_summary(title)
             yield event.plain_result(f"{title}\n{summary[:900]}\n{url}")
         except Exception as e:
-            logger.error(f"Wiki error: {e}\n{traceback.format_exc()}")
             yield event.plain_result(f"Wiki 搜索失败：{e}")
 
-    # /df.wiki —— 仅 Wiki
     @filter.command("df.wiki")
     async def cmd_wiki(self, event: AstrMessageEvent):
         q = event.message_str.strip().split(maxsplit=1)
@@ -472,7 +425,6 @@ class GameGuide(Star):
         except Exception as e:
             yield event.plain_result(f"Wiki 调用失败：{e}")
 
-    # /df.kb —— 仅查内容包/KB（优先内容包）
     @filter.command("df.kb")
     async def cmd_kb(self, event: AstrMessageEvent):
         q = event.message_str.strip().split(maxsplit=1)
@@ -487,8 +439,11 @@ class GameGuide(Star):
             return
         doc = self.kb.lookup(keyword)
         if doc:
-            chain = [Comp.Plain(doc.get("answer",""))] if doc.get("answer") else []
-            img = doc.get("image","")
+            chain = []
+            ans = (doc.get("answer") or "").strip()
+            if ans:
+                chain.append(Comp.Plain(ans))
+            img = (doc.get("image") or "").strip()
             if img:
                 if img.startswith("http"):
                     chain.append(Comp.Image.fromURL(img))
@@ -500,7 +455,6 @@ class GameGuide(Star):
             return
         yield event.plain_result("未命中内容包/KB。")
 
-    # /dfcfg —— 查看/设置配置（与前版一致）
     @filter.command("dfcfg")
     async def cmd_cfg(self, event: AstrMessageEvent):
         cfg = self.context.get_config()
@@ -508,12 +462,12 @@ class GameGuide(Star):
         mode = cfg.get("wiki_mode","mediawiki")
         lang = cfg.get("wiki_lang","en")
         mw_host = cfg.get("mw_host","dwarffortresswiki.org")
-        mw_path = cfg.get("mw_path_prefix","")
+        mw_path = cfg.get("mw_path_prefix",""
+        )
         kb_entries = len(self.kb.entries)
         pack_entries = len(self.pack.by_key)
         yield event.plain_result(f"pack_dir={pack_dir}\nwiki={mode}/{lang}/{mw_host}/{mw_path or '-'}\npack={pack_entries} 条, kb={kb_entries} 条")
 
-    # /df.sync —— 热加载内容包
     @filter.command("df.sync")
     async def cmd_sync(self, event: AstrMessageEvent):
         try:
@@ -522,7 +476,6 @@ class GameGuide(Star):
         except Exception as e:
             yield event.plain_result(f"重载失败：{e}")
 
-    # /df.list [prefix] —— 列出条目
     @filter.command("df.list")
     async def cmd_list(self, event: AstrMessageEvent):
         parts = event.message_str.strip().split(maxsplit=1)
@@ -530,11 +483,18 @@ class GameGuide(Star):
         keys = sorted({e.key for e in self.pack.by_key.values()})
         if prefix:
             keys = [k for k in keys if k.lower().startswith(prefix)]
-        if not keys:
-            yield event.plain_result("（空）")
-        else:
-            # 每条一行，避免超长
-            yield event.plain_result("\n".join(keys))
+        yield event.plain_result("（空）" if not keys else "\n".join(keys))
+
+    @filter.command("df.ping")
+    async def df_ping(self, event: AstrMessageEvent):
+        yield event.plain_result("df pong")
+
+    @filter.command("df.where")
+    async def df_where(self, event: AstrMessageEvent):
+        cfg = self.context.get_config()
+        pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
+        count = len(self.pack.by_key) if hasattr(self, "pack") else -1
+        yield event.plain_result(f"__file__={__file__}\npack_dir={pack_dir}\nentries={count}")
 
     async def terminate(self):
         try:
