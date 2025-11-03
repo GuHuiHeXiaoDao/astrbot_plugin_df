@@ -6,13 +6,13 @@
   },
   "wiki_mode": {
     "description": "选择Wiki来源",
-    "type": "select",
+    "type": "string",
     "options": ["mediawiki", "wikipedia", "fandom"],
     "default": "mediawiki"
   },
   "wiki_lang": {
     "description": "Wikipedia语言（仅 wikipedia 模式使用）",
-    "type": "select",
+    "type": "string",
     "options": ["en", "zh", "ja"],
     "default": "en"
   },
@@ -33,7 +33,7 @@
   },
   "wiki_limit": {
     "description": "搜索返回条数上限",
-    "type": "integer",
+    "type": "int",
     "default": 3
   }
 }
