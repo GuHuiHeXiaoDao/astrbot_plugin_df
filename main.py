@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+"""
+AstrBot 插件：DF 攻略（指令前缀 /df）
+- 采用 @staticmethod 处理器：签名为 handler(event)，避免“缺少 event/self”调用错误
+- 优先命中 内容包（Markdown+YAML 前言，支持图文混排）→ 再查旧式 KB → 最后查 DF Wiki
+- 提供 /df.sync 热加载、/df.list、/dfcfg 等指令
+"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,7 +15,7 @@ import yaml
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger, AstrBotConfig, FunctionTool
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 
 PLUGIN_DIR = os.path.dirname(__file__)
@@ -24,17 +30,25 @@ def _load_json(path: str, default: Any):
     except Exception:
         return default
 
-# --------- Globals to avoid 'self' binding issues ---------
+# ------------------------------------------------------------------
+# 全局保存实例，供静态处理器访问
 _STAR: "GameGuide" | None = None
+# ------------------------------------------------------------------
 
 # ---------------------- 内容包（Markdown+YAML） ----------------------
 class ContentEntry:
     def __init__(self, key: str, aliases: List[str], blocks: List[Dict[str, Any]]):
         self.key = key
         self.aliases = aliases or []
-        self.blocks = blocks
+        self.blocks = blocks  # [{type: text|image, content|src}]
 
 class ContentPack:
+    """
+    目录结构（默认 packs/df/）：
+      entries/*.md|*.json  # Markdown（支持 YAML front matter）或 JSON blocks
+      assets/...           # 本地图片资源
+    Markdown 正文中的 ![](path_or_url) 会被按出现顺序输出为图片消息；
+    """
     def __init__(self, pack_dir: str):
         self.pack_dir = pack_dir
         self.entries_dir = os.path.join(pack_dir, "entries")
@@ -70,7 +84,7 @@ class ContentPack:
                     for a in entry.aliases:
                         self.alias[self._norm(a)] = k
             except Exception as e:
-                logger.error(f"Load entry failed: {path} -> {e}")
+                logger.error(f"[ContentPack] Load entry failed: {path} -> {e}")
 
     def _split_front_matter(self, text: str):
         if text.startswith("---"):
@@ -108,6 +122,7 @@ class ContentPack:
         key = meta.get("key") or os.path.splitext(os.path.basename(path))[0]
         aliases = meta.get("aliases") or []
         blocks = self._parse_md_blocks(body)
+        # 追加 frontmatter images[]（可选）
         for src in (meta.get("images") or []):
             blocks.append({"type": "image", "src": str(src)})
         return ContentEntry(key=key, aliases=aliases, blocks=blocks)
@@ -141,6 +156,7 @@ class ContentPack:
                 if src.startswith("http://") or src.startswith("https://"):
                     chain.append(Comp.Image.fromURL(src))
                 else:
+                    # 相对 entries/、assets/、pack 根目录三处依次查找
                     abs1 = os.path.join(self.entries_dir, src)
                     abs2 = os.path.join(self.assets_dir, src)
                     abs3 = os.path.join(self.pack_dir, src)
@@ -152,7 +168,7 @@ class ContentPack:
                         chain.append(Comp.Plain(f"[提示] 找不到本地图片：{src}"))
         return chain
 
-# ---------------------- KB ----------------------
+# ---------------------- 关键字 KB（兼容） ----------------------
 class KeywordKB:
     def __init__(self, kb_path: str):
         self.kb_path = kb_path
@@ -167,7 +183,7 @@ class KeywordKB:
         k = self.normalize(key)
         return self.entries.get(k)
 
-# ---------------------- Wiki ----------------------
+# ---------------------- Wiki 客户端 ----------------------
 class WikiClient:
     def __init__(self, mode: str = "mediawiki", lang: str = "en",
                  fandom_site: str = "", mw_host: str = "dwarffortresswiki.org",
@@ -197,6 +213,7 @@ class WikiClient:
         else:
             return self._mediawiki_summary(title)
 
+    # Wikipedia
     def _wp_base(self):
         return f"https://{self.lang}.wikipedia.org/w/api.php"
     def _search_wikipedia(self, query: str, limit: int = 3):
@@ -219,6 +236,7 @@ class WikiClient:
             return extract[:900], url
         return "", f"https://{self.lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
 
+    # Fandom
     def _fd_host(self):
         host = (self.fandom_site or "www") + ".fandom.com"
         return f"https://{host}/api.php", host
@@ -244,6 +262,7 @@ class WikiClient:
             return extract[:900], url
         return "", f"https://{host}/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
 
+    # MediaWiki (DF 默认)
     def _mw_base(self):
         scheme = "https" if self.mw_https else "http"
         host = self.mw_host or "www.example.com"
@@ -270,7 +289,7 @@ class WikiClient:
             return extract[:900], url
         return "", url
 
-# ---------------------- LLM 工具 ----------------------
+# ---------------------- LLM 工具（可选） ----------------------
 @dataclass
 class KBLookupTool(FunctionTool):
     name: str = "kb_lookup"
@@ -278,7 +297,7 @@ class KBLookupTool(FunctionTool):
     parameters: dict = field(default_factory=lambda: {
         "type": "object",
         "properties": {
-            "keyword": {"type": "string", "description": "关键词"}
+            "keyword": {"type": "string", "description": "关键词（例如：水壶）"}
         },
         "required": ["keyword"]
     })
@@ -308,7 +327,7 @@ class WikiSearchTool(FunctionTool):
         "properties": {
             "query": {"type": "string", "description": "搜索关键词"},
             "title": {"type": "string", "description": "已知标题（可选）"},
-            "limit": {"type": "int", "description": "返回条数（默认3）"}
+            "limit": {"type": "int", "description": "返回条目数（默认3）"}
         },
         "required": ["query"]
     })
@@ -335,7 +354,7 @@ class WikiSearchTool(FunctionTool):
             return {"ok": False, "error": str(e)}
 
 # ---------------------- 插件主体 ----------------------
-@register("astrbot_plugin_df", "your_name", "DF 攻略（内容包+KB+Wiki+LLM）", "1.2.2")
+@register("astrbot_plugin_df", "your_name", "DF 攻略（内容包+KB+Wiki+LLM）", "1.2.3")
 class GameGuide(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -356,11 +375,11 @@ class GameGuide(Star):
             mw_path_prefix=self.config.get("mw_path_prefix","")
         )
 
-        # expose to globals for static handlers
+        # 暴露给静态处理器
         global _STAR
         _STAR = self
 
-        # register llm tools
+        # 注册 LLM 工具
         self.kb_tool = KBLookupTool(star_ref=self)
         self.wiki_tool = WikiSearchTool(star_ref=self)
         try:
@@ -372,7 +391,7 @@ class GameGuide(Star):
             except Exception as e2:
                 logger.warn(f"LLM tools registration failed: {e2}")
 
-    # -------- static handlers: framework calls handler(event) --------
+    # ---------- 静态处理器：签名为 handler(event) ----------
     @staticmethod
     @filter.command("df", alias=["攻略", "game", "guide"])
     async def cmd_df(event: AstrMessageEvent):
@@ -386,12 +405,14 @@ class GameGuide(Star):
             return
         keyword = q[1].strip()
 
+        # 1) 内容包
         entry = star.pack.match(keyword)
         if entry:
             chain = star.pack.render_chain(entry)
             yield event.chain_result(chain if chain else [Comp.Plain("该条目没有内容。")])
             return
 
+        # 2) 旧 KB
         doc = star.kb.lookup(keyword)
         if doc:
             chain = []
@@ -409,6 +430,7 @@ class GameGuide(Star):
             yield event.chain_result(chain) if chain else event.plain_result("KB 命中但无内容。")
             return
 
+        # 3) Wiki
         try:
             items = star.wiki.search(keyword, limit=int(star.config.get("wiki_limit", 3)))
             if not items:
@@ -522,6 +544,7 @@ class GameGuide(Star):
             keys = [k for k in keys if k.lower().startswith(prefix)]
         yield event.plain_result("（空）" if not keys else "\n".join(keys))
 
+    # 诊断
     @staticmethod
     @filter.command("df.ping")
     async def df_ping(event: AstrMessageEvent):
@@ -532,7 +555,7 @@ class GameGuide(Star):
     async def df_where(event: AstrMessageEvent):
         star = _STAR
         if star is None:
-            yield event.plain_result("__file__={}\npack_dir=?\nentries=?".format(__file__))
+            yield event.plain_result(f"__file__={__file__}\npack_dir=?\nentries=?")
             return
         cfg = star.config
         pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
