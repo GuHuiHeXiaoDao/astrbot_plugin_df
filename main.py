@@ -24,6 +24,10 @@ def _load_json(path: str, default: Any):
     except Exception:
         return default
 
+# --------- Globals to avoid 'self' binding issues ---------
+_STAR: "GameGuide" | None = None
+
+# ---------------------- 内容包（Markdown+YAML） ----------------------
 class ContentEntry:
     def __init__(self, key: str, aliases: List[str], blocks: List[Dict[str, Any]]):
         self.key = key
@@ -70,7 +74,6 @@ class ContentPack:
 
     def _split_front_matter(self, text: str):
         if text.startswith("---"):
-            import re, yaml
             m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
             if m:
                 try:
@@ -149,6 +152,7 @@ class ContentPack:
                         chain.append(Comp.Plain(f"[提示] 找不到本地图片：{src}"))
         return chain
 
+# ---------------------- KB ----------------------
 class KeywordKB:
     def __init__(self, kb_path: str):
         self.kb_path = kb_path
@@ -163,6 +167,7 @@ class KeywordKB:
         k = self.normalize(key)
         return self.entries.get(k)
 
+# ---------------------- Wiki ----------------------
 class WikiClient:
     def __init__(self, mode: str = "mediawiki", lang: str = "en",
                  fandom_site: str = "", mw_host: str = "dwarffortresswiki.org",
@@ -265,6 +270,7 @@ class WikiClient:
             return extract[:900], url
         return "", url
 
+# ---------------------- LLM 工具 ----------------------
 @dataclass
 class KBLookupTool(FunctionTool):
     name: str = "kb_lookup"
@@ -279,20 +285,17 @@ class KBLookupTool(FunctionTool):
     star_ref: "GameGuide" | None = None
 
     async def call(self, event: AstrMessageEvent, keyword: str) -> dict:
-        star = self.star_ref
+        star = self.star_ref or _STAR
         if not star:
             return {"found": False}
         entry = star.pack.match(keyword)
         if entry:
             texts = [blk["content"] for blk in entry.blocks if blk.get("type")=="text"]
-            images = []
-            for blk in entry.blocks:
-                if blk.get("type")=="image":
-                    images.append(blk.get("src",""))
+            images = [blk.get("src","") for blk in entry.blocks if blk.get("type")=="image"]
             return {"found": True, "text": "\n\n".join(texts), "images": images}
         doc = star.kb.lookup(keyword)
         if doc:
-            imgs = [doc.get("image"," ") .strip()] if doc.get("image") else []
+            imgs = [doc.get("image","")] if doc.get("image") else []
             return {"found": True, "text": doc.get("answer",""), "images": imgs}
         return {"found": False}
 
@@ -312,7 +315,7 @@ class WikiSearchTool(FunctionTool):
     star_ref: "GameGuide" | None = None
 
     async def call(self, event: AstrMessageEvent, query: str, title: str = "", limit: int = 3) -> dict:
-        star = self.star_ref
+        star = self.star_ref or _STAR
         if not star:
             return {"ok": False, "error": "star not ready"}
         wiki = star.wiki
@@ -324,15 +327,15 @@ class WikiSearchTool(FunctionTool):
             if not items:
                 return {"ok": True, "results": []}
             first = items[0]
-            summary, url = wiki.page_summary(first["title"]
-            )
+            summary, url = wiki.page_summary(first["title"])
             first["summary"] = summary
             first["url"] = url
             return {"ok": True, "results": [first] + items[1:]}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-@register("astrbot_plugin_df", "your_name", "DF 攻略（内容包+KB+Wiki+LLM）", "1.2.1")
+# ---------------------- 插件主体 ----------------------
+@register("astrbot_plugin_df", "your_name", "DF 攻略（内容包+KB+Wiki+LLM）", "1.2.2")
 class GameGuide(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -350,10 +353,14 @@ class GameGuide(Star):
             fandom_site=self.config.get("fandom_site",""),
             mw_host=self.config.get("mw_host","dwarffortresswiki.org"),
             mw_https=bool(self.config.get("mw_https", True)),
-            mw_path_prefix=self.config.get("mw_path_prefix",""
-            )
+            mw_path_prefix=self.config.get("mw_path_prefix","")
         )
 
+        # expose to globals for static handlers
+        global _STAR
+        _STAR = self
+
+        # register llm tools
         self.kb_tool = KBLookupTool(star_ref=self)
         self.wiki_tool = WikiSearchTool(star_ref=self)
         try:
@@ -365,21 +372,27 @@ class GameGuide(Star):
             except Exception as e2:
                 logger.warn(f"LLM tools registration failed: {e2}")
 
+    # -------- static handlers: framework calls handler(event) --------
+    @staticmethod
     @filter.command("df", alias=["攻略", "game", "guide"])
-    async def cmd_df(self, event: AstrMessageEvent):
+    async def cmd_df(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("插件尚未初始化完成。")
+            return
         q = event.message_str.strip().split(maxsplit=1)
         if len(q) < 2 or not q[1].strip():
             yield event.plain_result("用法：/df <关键词>  （内容包→KB→Wiki）")
             return
         keyword = q[1].strip()
 
-        entry = self.pack.match(keyword)
+        entry = star.pack.match(keyword)
         if entry:
-            chain = self.pack.render_chain(entry)
+            chain = star.pack.render_chain(entry)
             yield event.chain_result(chain if chain else [Comp.Plain("该条目没有内容。")])
             return
 
-        doc = self.kb.lookup(keyword)
+        doc = star.kb.lookup(keyword)
         if doc:
             chain = []
             ans = (doc.get("answer") or "").strip()
@@ -397,47 +410,57 @@ class GameGuide(Star):
             return
 
         try:
-            items = self.wiki.search(keyword, limit=int(self.config.get("wiki_limit", 3)))
+            items = star.wiki.search(keyword, limit=int(star.config.get("wiki_limit", 3)))
             if not items:
                 yield event.plain_result("未找到相关条目。")
                 return
             title = items[0]["title"]
-            summary, url = self.wiki.page_summary(title)
+            summary, url = star.wiki.page_summary(title)
             yield event.plain_result(f"{title}\n{summary[:900]}\n{url}")
         except Exception as e:
             yield event.plain_result(f"Wiki 搜索失败：{e}")
 
+    @staticmethod
     @filter.command("df.wiki")
-    async def cmd_wiki(self, event: AstrMessageEvent):
+    async def cmd_wiki(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("插件尚未初始化完成。")
+            return
         q = event.message_str.strip().split(maxsplit=1)
         if len(q) < 2:
             yield event.plain_result("用法：/df.wiki <关键词或标题>")
             return
         keyword = q[1].strip()
         try:
-            items = self.wiki.search(keyword, limit=int(self.config.get("wiki_limit", 5)))
+            items = star.wiki.search(keyword, limit=int(star.config.get("wiki_limit", 5)))
             if not items:
                 yield event.plain_result("没有搜索到相关条目。")
                 return
             title = items[0]["title"]
-            summary, url = self.wiki.page_summary(title)
+            summary, url = star.wiki.page_summary(title)
             yield event.plain_result(f"{title}\n{summary[:900]}\n{url}")
         except Exception as e:
             yield event.plain_result(f"Wiki 调用失败：{e}")
 
+    @staticmethod
     @filter.command("df.kb")
-    async def cmd_kb(self, event: AstrMessageEvent):
+    async def cmd_kb(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("插件尚未初始化完成。")
+            return
         q = event.message_str.strip().split(maxsplit=1)
         if len(q) < 2:
             yield event.plain_result("用法：/df.kb <关键词>")
             return
         keyword = q[1].strip()
-        entry = self.pack.match(keyword)
+        entry = star.pack.match(keyword)
         if entry:
-            chain = self.pack.render_chain(entry)
+            chain = star.pack.render_chain(entry)
             yield event.chain_result(chain) if chain else event.plain_result("条目没有内容。")
             return
-        doc = self.kb.lookup(keyword)
+        doc = star.kb.lookup(keyword)
         if doc:
             chain = []
             ans = (doc.get("answer") or "").strip()
@@ -455,45 +478,65 @@ class GameGuide(Star):
             return
         yield event.plain_result("未命中内容包/KB。")
 
+    @staticmethod
     @filter.command("dfcfg")
-    async def cmd_cfg(self, event: AstrMessageEvent):
-        cfg = self.context.get_config()
-        pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
-        mode = cfg.get("wiki_mode","mediawiki")
-        lang = cfg.get("wiki_lang","en")
-        mw_host = cfg.get("mw_host","dwarffortresswiki.org")
-        mw_path = cfg.get("mw_path_prefix",""
-        )
-        kb_entries = len(self.kb.entries)
-        pack_entries = len(self.pack.by_key)
-        yield event.plain_result(f"pack_dir={pack_dir}\nwiki={mode}/{lang}/{mw_host}/{mw_path or '-'}\npack={pack_entries} 条, kb={kb_entries} 条")
+    async def cmd_cfg(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("插件尚未初始化完成。")
+        else:
+            cfg = star.config
+            pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
+            mode = cfg.get("wiki_mode","mediawiki")
+            lang = cfg.get("wiki_lang","en")
+            mw_host = cfg.get("mw_host","dwarffortresswiki.org")
+            mw_path = cfg.get("mw_path_prefix","")
+            kb_entries = len(star.kb.entries)
+            pack_entries = len(star.pack.by_key)
+            yield event.plain_result(f"pack_dir={pack_dir}\nwiki={mode}/{lang}/{mw_host}/{mw_path or '-'}\npack={pack_entries} 条, kb={kb_entries} 条")
 
+    @staticmethod
     @filter.command("df.sync")
-    async def cmd_sync(self, event: AstrMessageEvent):
+    async def cmd_sync(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("插件尚未初始化完成。")
+            return
         try:
-            self.pack.reload()
-            yield event.plain_result(f"内容包已重载：{len(self.pack.by_key)} 条。")
+            star.pack.reload()
+            yield event.plain_result(f"内容包已重载：{len(star.pack.by_key)} 条。")
         except Exception as e:
             yield event.plain_result(f"重载失败：{e}")
 
+    @staticmethod
     @filter.command("df.list")
-    async def cmd_list(self, event: AstrMessageEvent):
+    async def cmd_list(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("插件尚未初始化完成。")
+            return
         parts = event.message_str.strip().split(maxsplit=1)
         prefix = parts[1].strip().lower() if len(parts) > 1 else ""
-        keys = sorted({e.key for e in self.pack.by_key.values()})
+        keys = sorted({e.key for e in star.pack.by_key.values()})
         if prefix:
             keys = [k for k in keys if k.lower().startswith(prefix)]
         yield event.plain_result("（空）" if not keys else "\n".join(keys))
 
+    @staticmethod
     @filter.command("df.ping")
-    async def df_ping(self, event: AstrMessageEvent):
+    async def df_ping(event: AstrMessageEvent):
         yield event.plain_result("df pong")
 
+    @staticmethod
     @filter.command("df.where")
-    async def df_where(self, event: AstrMessageEvent):
-        cfg = self.context.get_config()
+    async def df_where(event: AstrMessageEvent):
+        star = _STAR
+        if star is None:
+            yield event.plain_result("__file__={}\npack_dir=?\nentries=?".format(__file__))
+            return
+        cfg = star.config
         pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
-        count = len(self.pack.by_key) if hasattr(self, "pack") else -1
+        count = len(star.pack.by_key)
         yield event.plain_result(f"__file__={__file__}\npack_dir={pack_dir}\nentries={count}")
 
     async def terminate(self):
