@@ -1,2 +1,1 @@
-requests>=2.31.0,<3
-PyYAML>=6.0.2,<7
+# empty; stdlib only
