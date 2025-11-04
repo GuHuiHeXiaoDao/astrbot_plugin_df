@@ -1,531 +1,367 @@
 # -*- coding: utf-8 -*-
 """
 AstrBot 插件：DF 攻略（指令前缀 /df）
-- 采用 @staticmethod 处理器：签名为 handler(event)，避免“缺少 event/self”调用错误
-- 优先命中 内容包（Markdown+YAML 前言，支持图文混排）→ 再查旧式 KB → 最后查 DF Wiki
-- 提供 /df.sync 热加载、/df.list、/dfcfg 等指令
+关键词检索：使用 KeywordResolver（精确→别名→前缀/包含→模糊）统一解析。
+命中“图文”（内容包/KB）→ 只输出图文；否则→ DF Wiki 摘要。
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-import os, re, json, urllib.parse, traceback
+from dataclasses import dataclass
+import os, re, json, urllib.parse, difflib
 
 import requests
 import yaml
 
 import astrbot.api.message_components as Comp
-from astrbot.api import logger, AstrBotConfig, FunctionTool
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 
+# ---------- utils ----------
 PLUGIN_DIR = os.path.dirname(__file__)
-
-def _abspath(*p):
-    return os.path.join(PLUGIN_DIR, *p)
-
-def _load_json(path: str, default: Any):
+def _abspath(*p: str) -> str: return os.path.join(PLUGIN_DIR, *p)
+def _norm(s: str) -> str: return s.strip().lower()
+def _read_json(path: str, default: Any) -> Any:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
+def _write_json(path: str, data: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
 
-# ------------------------------------------------------------------
-# 全局保存实例，供静态处理器访问
-_STAR: "GameGuide" | None = None
-# ------------------------------------------------------------------
+def _to_halfwidth(s: str) -> str:
+    """全角转半角（常用符号/空格），利于中文检索归一化。"""
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code == 0x3000:  # 全角空格
+            out.append(' ')
+        elif 0xFF01 <= code <= 0xFF5E:
+            out.append(chr(code - 0xFEE0))
+        else:
+            out.append(ch)
+    return ''.join(out)
 
-# ---------------------- 内容包（Markdown+YAML） ----------------------
+def _clean_norm(s: str) -> str:
+    """更强的标准化：全角→半角，去多余空白，小写。"""
+    s = _to_halfwidth(s)
+    s = s.replace('\u200b', '')  # 零宽
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip().lower()
+
+# ---------- content_pack ----------
+@dataclass
 class ContentEntry:
-    def __init__(self, key: str, aliases: List[str], blocks: List[Dict[str, Any]]):
-        self.key = key
-        self.aliases = aliases or []
-        self.blocks = blocks  # [{type: text|image, content|src}]
+    key: str; aliases: List[str]; blocks: List[Dict[str, Any]]
 
 class ContentPack:
-    """
-    目录结构（默认 packs/df/）：
-      entries/*.md|*.json  # Markdown（支持 YAML front matter）或 JSON blocks
-      assets/...           # 本地图片资源
-    Markdown 正文中的 ![](path_or_url) 会被按出现顺序输出为图片消息；
-    """
     def __init__(self, pack_dir: str):
         self.pack_dir = pack_dir
         self.entries_dir = os.path.join(pack_dir, "entries")
-        self.assets_dir = os.path.join(pack_dir, "assets")
-        self.by_key: Dict[str, ContentEntry] = {}
-        self.alias: Dict[str, str] = {}
+        self.assets_dir  = os.path.join(pack_dir, "assets")
+        self.by_key: Dict[str, ContentEntry] = {}; self.alias: Dict[str, str] = {}
         self.reload()
 
-    @staticmethod
-    def _norm(s: str) -> str:
-        return s.strip().lower()
-
-    def reload(self):
-        self.by_key.clear()
-        self.alias.clear()
-        if not os.path.isdir(self.entries_dir):
-            return
+    def reload(self) -> None:
+        self.by_key.clear(); self.alias.clear()
+        if not os.path.isdir(self.entries_dir): return
         for fn in os.listdir(self.entries_dir):
-            path = os.path.join(self.entries_dir, fn)
-            if not os.path.isfile(path):
-                continue
+            p = os.path.join(self.entries_dir, fn)
+            if not os.path.isfile(p): continue
             try:
-                if fn.endswith(".md"):
-                    entry = self._load_md(path)
-                elif fn.endswith(".json"):
-                    entry = self._load_json_entry(path)
-                else:
-                    continue
-                if entry:
-                    k = self._norm(entry.key)
-                    self.by_key[k] = entry
-                    self.alias[k] = k
-                    for a in entry.aliases:
-                        self.alias[self._norm(a)] = k
-            except Exception as e:
-                logger.error(f"[ContentPack] Load entry failed: {path} -> {e}")
+                if fn.endswith(".md"): e = self._load_md(p)
+                elif fn.endswith(".json"): e = self._load_json_entry(p)
+                else: continue
+                if e:
+                    k = _norm(e.key); self.by_key[k] = e; self.alias[k] = k
+                    for a in e.aliases: self.alias[_clean_norm(a)] = k
+            except Exception as ex:
+                logger.error(f"[ContentPack] load fail {p}: {ex}")
 
     def _split_front_matter(self, text: str):
         if text.startswith("---"):
             m = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
             if m:
-                try:
-                    front = yaml.safe_load(m.group(1)) or {}
-                except Exception:
-                    front = {}
-                body = m.group(2)
-                return front, body
+                try: front = yaml.safe_load(m.group(1)) or {}
+                except Exception: front = {}
+                return front, m.group(2)
         return {}, text
 
     def _parse_md_blocks(self, body: str) -> List[Dict[str, Any]]:
-        blocks: List[Dict[str, Any]] = []
-        pos = 0
-        pattern = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
-        for m in pattern.finditer(body):
-            start, end = m.span()
-            img_src = m.group(1).strip()
-            txt = body[pos:start].strip()
-            if txt:
-                blocks.append({"type": "text", "content": txt})
-            blocks.append({"type": "image", "src": img_src})
-            pos = end
+        blocks: List[Dict[str, Any]] = []; pos = 0
+        pat = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
+        for m in pat.finditer(body):
+            s, e = m.span(); img = m.group(1).strip(); txt = body[pos:s].strip()
+            if txt: blocks.append({"type":"text","content":txt})
+            blocks.append({"type":"image","src":img}); pos = e
         tail = body[pos:].strip()
-        if tail:
-            blocks.append({"type": "text", "content": tail})
-        return blocks or [{"type": "text", "content": body.strip()}]
+        if tail: blocks.append({"type":"text","content":tail})
+        return blocks or [{"type":"text","content":body.strip()}]
 
     def _load_md(self, path: str) -> Optional[ContentEntry]:
-        with open(path, "r", encoding="utf-8") as f:
-            text = f.read()
+        with open(path, "r", encoding="utf-8") as f: text = f.read()
         meta, body = self._split_front_matter(text)
         key = meta.get("key") or os.path.splitext(os.path.basename(path))[0]
         aliases = meta.get("aliases") or []
         blocks = self._parse_md_blocks(body)
-        # 追加 frontmatter images[]（可选）
-        for src in (meta.get("images") or []):
-            blocks.append({"type": "image", "src": str(src)})
-        return ContentEntry(key=key, aliases=aliases, blocks=blocks)
+        for src in (meta.get("images") or []): blocks.append({"type":"image","src":str(src)})
+        return ContentEntry(key, aliases, blocks)
 
     def _load_json_entry(self, path: str) -> Optional[ContentEntry]:
-        data = _load_json(path, {})
-        key = data.get("key") or os.path.splitext(os.path.basename(path))[0]
-        aliases = data.get("aliases") or []
-        blocks = data.get("blocks") or []
-        return ContentEntry(key=key, aliases=aliases, blocks=blocks)
+        data = _read_json(path, {}); key = data.get("key") or os.path.splitext(os.path.basename(path))[0]
+        return ContentEntry(key, data.get("aliases") or [], data.get("blocks") or [])
 
     def match(self, keyword: str) -> Optional[ContentEntry]:
-        if not keyword:
-            return None
-        k = self._norm(keyword)
-        if k in self.alias:
-            return self.by_key.get(self.alias[k])
-        return None
+        if not keyword: return None
+        k = _norm(keyword); return self.by_key.get(self.alias.get(k,k))
 
     def render_chain(self, entry: ContentEntry) -> List[Any]:
         chain: List[Any] = []
-        for blk in entry.blocks:
-            if blk.get("type") == "text":
-                content = str(blk.get("content", "")).strip()
-                if content:
-                    chain.append(Comp.Plain(content))
-            elif blk.get("type") == "image":
-                src = str(blk.get("src", "")).strip()
-                if not src:
-                    continue
-                if src.startswith("http://") or src.startswith("https://"):
-                    chain.append(Comp.Image.fromURL(src))
+        for b in entry.blocks:
+            if b.get("type")=="text":
+                t = str(b.get("content","")).strip()
+                if t: chain.append(Comp.Plain(t))
+            elif b.get("type")=="image":
+                src = str(b.get("src","")).strip()
+                if not src: continue
+                if src.startswith("http"): chain.append(Comp.Image.fromURL(src))
                 else:
-                    # 相对 entries/、assets/、pack 根目录三处依次查找
-                    abs1 = os.path.join(self.entries_dir, src)
-                    abs2 = os.path.join(self.assets_dir, src)
-                    abs3 = os.path.join(self.pack_dir, src)
-                    for candidate in (abs1, abs2, abs3):
-                        if os.path.exists(candidate):
-                            chain.append(Comp.Image.fromFileSystem(candidate))
-                            break
-                    else:
-                        chain.append(Comp.Plain(f"[提示] 找不到本地图片：{src}"))
+                    for cand in (os.path.join(self.entries_dir,src),
+                                 os.path.join(self.assets_dir,src),
+                                 os.path.join(self.pack_dir,src)):
+                        if os.path.exists(cand): chain.append(Comp.Image.fromFileSystem(cand)); break
+                    else: chain.append(Comp.Plain(f"[提示] 找不到本地图片：{src}"))
         return chain
 
-# ---------------------- 关键字 KB（兼容） ----------------------
+# ---------- catalog ----------
+class Catalog:
+    def __init__(self, path: str):
+        self.path = path
+        data = _read_json(path, {"aliases": {}, "wiki": {}})
+        self.aliases: Dict[str,str] = { _clean_norm(k): v.strip() for k,v in data.get("aliases",{}).items() }
+        self.wiki: Dict[str,str] = data.get("wiki",{})
+    def resolve(self, term: str) -> str: return self.aliases.get(_clean_norm(term), term.strip())
+    def wiki_title(self, term: str) -> Optional[str]:
+        return self.wiki.get(term.strip()) or self.wiki.get(self.resolve(term))
+    def add_alias(self, alias: str, target: str): self.aliases[_clean_norm(alias)] = target.strip(); self.save()
+    def remove_alias(self, alias: str): self.aliases.pop(_clean_norm(alias), None); self.save()
+    def save(self): _write_json(self.path, {"aliases": self.aliases, "wiki": self.wiki})
+
+# ---------- kb ----------
 class KeywordKB:
-    def __init__(self, kb_path: str):
-        self.kb_path = kb_path
-        self.data = _load_json(kb_path, default={"aliases": {}, "entries": {}})
-        self.alias = {k.lower(): v for k, v in self.data.get("aliases", {}).items()}
-        self.entries = self.data.get("entries", {})
+    def __init__(self, path: str):
+        self.data = _read_json(path, {"aliases": {}, "entries": {}})
+        self.alias = { _clean_norm(k): v.strip() for k,v in self.data.get("aliases",{}).items() }
+        self.entries = self.data.get("entries",{})
+    def normalize(self, k: str) -> str: return self.alias.get(_clean_norm(k), k.strip())
+    def lookup(self, k: str) -> Optional[Dict[str, Any]]: return self.entries.get(self.normalize(k))
 
-    def normalize(self, key: str) -> str:
-        return self.alias.get(key.strip().lower(), key.strip())
+# ---------- wiki ----------
+class DFWikiClient:
+    def __init__(self, host: str = "dwarffortresswiki.org", https: bool = True, prefix: str = ""):
+        self.host, self.https = host, https
+        self.prefix = prefix.strip("/");  self.prefix += ("/" if self.prefix else "")
+    def _base(self) -> str: return f"{'https' if self.https else 'http'}://{self.host}/{self.prefix}api.php"
+    def _page(self, title: str) -> str: return f"{'https' if self.https else 'http'}://{self.host}/{self.prefix}index.php/" + urllib.parse.quote(title.replace(" ","_"))
+    def search(self, q: str, limit: int = 3) -> List[Dict[str,str]]:
+        r = requests.get(self._base(), params={"action":"query","list":"search","srsearch":q,"srlimit":limit,"format":"json"}, timeout=10); r.raise_for_status()
+        out=[]; 
+        for it in r.json().get("query",{}).get("search",[]): out.append({"title": it.get("title"), "url": self._page(it.get("title"))})
+        return out
+    def summary(self, title: str) -> str:
+        r = requests.get(self._base(), params={"action":"query","prop":"extracts","exintro":1,"explaintext":1,"titles":title,"format":"json"}, timeout=10); r.raise_for_status()
+        for _,v in r.json().get("query",{}).get("pages",{}).items(): return (v.get("extract","") or "").strip()
+        return ""
 
-    def lookup(self, key: str) -> Optional[Dict[str, Any]]:
-        k = self.normalize(key)
-        return self.entries.get(k)
+# ---------- redesigned keyword resolver ----------
+class KeywordResolver:
+    """
+    统一关键字检索：
+    - exact：精确命中 key 或别名（pack/kb/catalog）
+    - prefix：前缀命中
+    - contains：包含命中（原词包含条目名或相反）
+    - fuzzy：difflib 相似度（默认阈值 0.84）
+    返回（canon, where, matched, score），canon 可用于 pack.match/kb.lookup。
+    """
+    def __init__(self, pack: ContentPack, kb: KeywordKB, cat: Catalog, fuzzy_threshold: float = 0.84):
+        self.pack, self.kb, self.cat = pack, kb, cat
+        self.fuzzy_threshold = fuzzy_threshold
+        self.index: Dict[str, Tuple[str,str]] = {}  # term_norm -> (where, canonical)
+        self._build_index()
 
-# ---------------------- Wiki 客户端 ----------------------
-class WikiClient:
-    def __init__(self, mode: str = "mediawiki", lang: str = "en",
-                 fandom_site: str = "", mw_host: str = "dwarffortresswiki.org",
-                 mw_https: bool = True, mw_path_prefix: str = ""):
-        self.mode = mode
-        self.lang = lang
-        self.fandom_site = fandom_site
-        self.mw_host = mw_host
-        self.mw_https = mw_https
-        self.mw_path_prefix = mw_path_prefix.strip("/")
-        if self.mw_path_prefix:
-            self.mw_path_prefix += "/"
+    def _add(self, term: str, where: str, canonical: str):
+        t = _clean_norm(term)
+        if t: self.index[t] = (where, canonical)
 
-    def search(self, query: str, limit: int = 3) -> List[Dict[str, Any]]:
-        if self.mode == "wikipedia":
-            return self._search_wikipedia(query, limit)
-        elif self.mode == "fandom":
-            return self._search_fandom(query, limit)
+    def _build_index(self):
+        # pack keys / aliases -> pack:key
+        for k in self.pack.by_key.keys():
+            self._add(k, "pack", k)
+        for alias, key in self.pack.alias.items():
+            self._add(alias, "pack", key)
+        # kb entries / aliases -> kb:key
+        for k in self.kb.entries.keys():
+            self._add(k, "kb", k)
+        for alias, key in self.kb.alias.items():
+            self._add(alias, "kb", key)
+        # catalog aliases -> alias:target（where=alias），catalog wiki keys也加入（where=wiki）
+        for a, tgt in self.cat.aliases.items():
+            self._add(a, "alias", tgt)
+        for term in self.cat.wiki.keys():
+            self._add(term, "wiki", term)
+
+    def resolve(self, raw: str) -> Tuple[Optional[str], str, str, float]:
+        """返回 (canon, where, matched, score)；canon 可为空（未命中）。"""
+        q = _clean_norm(raw)
+        if not q: return None, "", "", 0.0
+        best = (None, "", "", 0.0)  # type: Tuple[Optional[str], str, str, float]
+
+        # 1) exact
+        if q in self.index:
+            where, canon = self.index[q]
+            return canon, where, q, 1.0
+
+        # 预先收集候选
+        terms = list(self.index.keys())
+
+        def update(candidate_term: str, score: float):
+            nonlocal best
+            where, canon = self.index[candidate_term]
+            if score > best[3]:
+                best = (canon, where, candidate_term, score)
+
+        # 2) prefix / contains
+        for t in terms:
+            if t.startswith(q):
+                update(t, 0.96)
+            elif q.startswith(t):
+                update(t, 0.93)
+            elif t in q or q in t:
+                update(t, 0.90)
+
+        # 3) fuzzy
+        # 选取与 q 相似的 topN（用 difflib，避免第三方依赖）
+        close = difflib.get_close_matches(q, terms, n=5, cutoff=self.fuzzy_threshold)
+        for t in close:
+            ratio = difflib.SequenceMatcher(None, q, t).ratio()
+            update(t, ratio)
+
+        return best  # 可能 (None, "", "", 0.0)
+
+# ---------- query ----------
+def chain_from_kb(kb_doc: Dict[str, Any]) -> List[Any]:
+    chain: List[Any] = []
+    ans = (kb_doc.get("answer") or "").strip()
+    img = (kb_doc.get("image") or "").strip()
+    if ans: chain.append(Comp.Plain(ans))
+    if img:
+        if img.startswith("http"): chain.append(Comp.Image.fromURL(img))
         else:
-            return self._search_mediawiki(query, limit)
+            local = _abspath("assets","images",img) if not os.path.isabs(img) else img
+            if os.path.exists(local): chain.append(Comp.Image.fromFileSystem(local))
+    return chain
 
-    def page_summary(self, title: str) -> Tuple[str, str]:
-        if self.mode == "wikipedia":
-            return self._wikipedia_summary(title)
-        elif self.mode == "fandom":
-            return self._fandom_summary(title)
-        else:
-            return self._mediawiki_summary(title)
+def query_flow(raw: str, pack: ContentPack, kb: KeywordKB, cat: Catalog, wiki: DFWikiClient, resolver: KeywordResolver) -> Dict[str, Any]:
+    # 通过 resolver 统一解析 canon 关键词
+    canon, where, matched, score = resolver.resolve(raw)
+    kw = canon or cat.resolve(raw)
 
-    # Wikipedia
-    def _wp_base(self):
-        return f"https://{self.lang}.wikipedia.org/w/api.php"
-    def _search_wikipedia(self, query: str, limit: int = 3):
-        params = {"action": "query", "list": "search", "srsearch": query, "srlimit": limit, "format": "json"}
-        r = requests.get(self._wp_base(), params=params, timeout=10); r.raise_for_status()
-        data = r.json().get("query", {}).get("search", [])
-        out = []
-        for it in data:
-            title = it.get("title")
-            url = f"https://{self.lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-            out.append({"title": title, "url": url, "snippet": it.get("snippet", "")})
-        return out
-    def _wikipedia_summary(self, title: str) -> Tuple[str, str]:
-        params = {"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1, "titles": title, "format": "json"}
-        r = requests.get(self._wp_base(), params=params, timeout=10); r.raise_for_status()
-        pages = r.json().get("query", {}).get("pages", {})
-        for _, v in pages.items():
-            extract = (v.get("extract", "") or "").strip()
-            url = f"https://{self.lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-            return extract[:900], url
-        return "", f"https://{self.lang}.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+    # 1) 内容包图文
+    entry = pack.match(kw)
+    if entry:
+        return {"type":"chain", "data": pack.render_chain(entry)}
 
-    # Fandom
-    def _fd_host(self):
-        host = (self.fandom_site or "www") + ".fandom.com"
-        return f"https://{host}/api.php", host
-    def _search_fandom(self, query: str, limit: int = 3):
-        base, host = self._fd_host()
-        params = {"action": "query", "list": "search", "srsearch": query, "srlimit": limit, "format": "json"}
-        r = requests.get(base, params=params, timeout=10); r.raise_for_status()
-        data = r.json().get("query", {}).get("search", [])
-        out = []
-        for it in data:
-            title = it.get("title")
-            url = f"https://{host}/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-            out.append({"title": title, "url": url, "snippet": it.get("snippet", "")})
-        return out
-    def _fandom_summary(self, title: str) -> Tuple[str, str]:
-        base, host = self._fd_host()
-        params = {"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1, "titles": title, "format": "json"}
-        r = requests.get(base, params=params, timeout=10); r.raise_for_status()
-        pages = r.json().get("query", {}).get("pages", {})
-        for _, v in pages.items():
-            extract = (v.get("extract", "") or "").strip()
-            url = f"https://{host}/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
-            return extract[:900], url
-        return "", f"https://{host}/wiki/" + urllib.parse.quote(title.replace(" ", "_"))
+    # 2) KB 图文
+    doc = kb.lookup(kw)
+    if doc:
+        ch = chain_from_kb(doc)
+        return {"type":"chain","data": ch} if ch else {"type":"plain","data":"（KB 命中但无图文内容）"}
 
-    # MediaWiki (DF 默认)
-    def _mw_base(self):
-        scheme = "https" if self.mw_https else "http"
-        host = self.mw_host or "www.example.com"
-        return f"{scheme}://{host}/{self.mw_path_prefix}api.php", host, scheme
-    def _search_mediawiki(self, query: str, limit: int = 3):
-        base, host, scheme = self._mw_base()
-        params = {"action": "query", "list": "search", "srsearch": query, "srlimit": limit, "format": "json"}
-        r = requests.get(base, params=params, timeout=10); r.raise_for_status()
-        data = r.json().get("query", {}).get("search", [])
-        out = []
-        for it in data:
-            title = it.get("title")
-            url = f"{scheme}://{host}/{self.mw_path_prefix}index.php/" + urllib.parse.quote(title.replace(" ", "_"))
-            out.append({"title": title, "url": url, "snippet": it.get("snippet", "")})
-        return out
-    def _mediawiki_summary(self, title: str) -> Tuple[str, str]:
-        base, host, scheme = self._mw_base()
-        params = {"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1, "titles": title, "format": "json"}
-        r = requests.get(base, params=params, timeout=10); r.raise_for_status()
-        pages = r.json().get("query", {}).get("pages", {})
-        url = f"{scheme}://{host}/{self.mw_path_prefix}index.php/" + urllib.parse.quote(title.replace(" ", "_"))
-        for _, v in pages.items():
-            extract = (v.get("extract", "") or "").strip()
-            return extract[:900], url
-        return "", url
+    # 3) 目录定向 Wiki 标题
+    title = cat.wiki_title(raw) or cat.wiki_title(kw) or (kw if where=="wiki" else None)
+    if title:
+        s = wiki.summary(title)[:900]
+        return {"type":"plain","data": f"{title}\n{s}\n{wiki._page(title)}"}
 
-# ---------------------- LLM 工具（可选） ----------------------
-@dataclass
-class KBLookupTool(FunctionTool):
-    name: str = "kb_lookup"
-    description: str = "在内容包/KB中查找预置答案（含图片列表）。"
-    parameters: dict = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "keyword": {"type": "string", "description": "关键词（例如：水壶）"}
-        },
-        "required": ["keyword"]
-    })
-    star_ref: "GameGuide" | None = None
+    # 4) DF Wiki 搜索兜底
+    items = wiki.search(kw, 3)
+    if not items: return {"type":"plain","data":"未在 DF Wiki 找到相关条目。"}
+    t0 = items[0]["title"]; s = wiki.summary(t0)[:900]
+    return {"type":"plain","data": f"{t0}\n{s}\n{wiki._page(t0)}"}
 
-    async def call(self, event: AstrMessageEvent, keyword: str) -> dict:
-        star = self.star_ref or _STAR
-        if not star:
-            return {"found": False}
-        entry = star.pack.match(keyword)
-        if entry:
-            texts = [blk["content"] for blk in entry.blocks if blk.get("type")=="text"]
-            images = [blk.get("src","") for blk in entry.blocks if blk.get("type")=="image"]
-            return {"found": True, "text": "\n\n".join(texts), "images": images}
-        doc = star.kb.lookup(keyword)
-        if doc:
-            imgs = [doc.get("image","")] if doc.get("image") else []
-            return {"found": True, "text": doc.get("answer",""), "images": imgs}
-        return {"found": False}
+# ---------- plugin ----------
+_STAR: "GameGuide" | None = None
 
-@dataclass
-class WikiSearchTool(FunctionTool):
-    name: str = "wiki_search"
-    description: str = "Wiki 搜索并返回摘要。"
-    parameters: dict = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "搜索关键词"},
-            "title": {"type": "string", "description": "已知标题（可选）"},
-            "limit": {"type": "int", "description": "返回条目数（默认3）"}
-        },
-        "required": ["query"]
-    })
-    star_ref: "GameGuide" | None = None
-
-    async def call(self, event: AstrMessageEvent, query: str, title: str = "", limit: int = 3) -> dict:
-        star = self.star_ref or _STAR
-        if not star:
-            return {"ok": False, "error": "star not ready"}
-        wiki = star.wiki
-        try:
-            if title:
-                summary, url = wiki.page_summary(title)
-                return {"ok": True, "results": [{"title": title, "summary": summary, "url": url}]}
-            items = wiki.search(query, limit=limit or 3)
-            if not items:
-                return {"ok": True, "results": []}
-            first = items[0]
-            summary, url = wiki.page_summary(first["title"])
-            first["summary"] = summary
-            first["url"] = url
-            return {"ok": True, "results": [first] + items[1:]}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-# ---------------------- 插件主体 ----------------------
-@register("astrbot_plugin_df", "your_name", "DF 攻略（内容包+KB+Wiki+LLM）", "1.2.3")
+@register("astrbot_plugin_df", "your_name", "DF 攻略（图文优先 + DF Wiki 兜底）", "1.6.0")
 class GameGuide(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or AstrBotConfig({})
-
-        pack_dir = self.config.get("pack_dir", _abspath("packs", "df"))
-        self.pack = ContentPack(pack_dir)
-
-        kb_path = _abspath("kb", "keywords.json")
-        self.kb = KeywordKB(kb_path)
-
-        self.wiki = WikiClient(
-            mode=self.config.get("wiki_mode","mediawiki"),
-            lang=self.config.get("wiki_lang","en"),
-            fandom_site=self.config.get("fandom_site",""),
-            mw_host=self.config.get("mw_host","dwarffortresswiki.org"),
-            mw_https=bool(self.config.get("mw_https", True)),
-            mw_path_prefix=self.config.get("mw_path_prefix","")
+        self.pack = ContentPack(self.config.get("pack_dir", _abspath("packs","df")))
+        self.kb   = KeywordKB(_abspath("kb","keywords.json"))
+        self.cat  = Catalog(_abspath("catalog","keywords.json"))
+        self.wiki = DFWikiClient(
+            host=self.config.get("mw_host","dwarffortresswiki.org"),
+            https=bool(self.config.get("mw_https", True)),
+            prefix=self.config.get("mw_path_prefix","")
         )
+        self.resolver = KeywordResolver(self.pack, self.kb, self.cat, fuzzy_threshold=float(self.config.get("fuzzy_threshold", 0.84)))
+        global _STAR; _STAR = self
 
-        # 暴露给静态处理器
-        global _STAR
-        _STAR = self
-
-        # 注册 LLM 工具
-        self.kb_tool = KBLookupTool(star_ref=self)
-        self.wiki_tool = WikiSearchTool(star_ref=self)
-        try:
-            self.context.add_llm_tools(self.kb_tool, self.wiki_tool)
-        except Exception:
-            try:
-                mgr = self.context.provider_manager.llm_tools
-                mgr.func_list.extend([self.kb_tool, self.wiki_tool])
-            except Exception as e2:
-                logger.warn(f"LLM tools registration failed: {e2}")
-
-    # ---------- 静态处理器：签名为 handler(event) ----------
     @staticmethod
-    @filter.command("df", alias=["攻略", "game", "guide"])
+    @filter.command("df", alias=["攻略","game","guide"])
     async def cmd_df(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result("插件尚未初始化完成。")
-            return
-        q = event.message_str.strip().split(maxsplit=1)
-        if len(q) < 2 or not q[1].strip():
-            yield event.plain_result("用法：/df <关键词>  （内容包→KB→Wiki）")
-            return
-        keyword = q[1].strip()
-
-        # 1) 内容包
-        entry = star.pack.match(keyword)
-        if entry:
-            chain = star.pack.render_chain(entry)
-            yield event.chain_result(chain if chain else [Comp.Plain("该条目没有内容。")])
-            return
-
-        # 2) 旧 KB
-        doc = star.kb.lookup(keyword)
-        if doc:
-            chain = []
-            ans = (doc.get("answer") or "").strip()
-            if ans:
-                chain.append(Comp.Plain(ans))
-            img = (doc.get("image") or "").strip()
-            if img:
-                if img.startswith("http"):
-                    chain.append(Comp.Image.fromURL(img))
-                else:
-                    local = _abspath("assets", "images", img) if not os.path.isabs(img) else img
-                    if os.path.exists(local):
-                        chain.append(Comp.Image.fromFileSystem(local))
-            yield event.chain_result(chain) if chain else event.plain_result("KB 命中但无内容。")
-            return
-
-        # 3) Wiki
-        try:
-            items = star.wiki.search(keyword, limit=int(star.config.get("wiki_limit", 3)))
-            if not items:
-                yield event.plain_result("未找到相关条目。")
-                return
-            title = items[0]["title"]
-            summary, url = star.wiki.page_summary(title)
-            yield event.plain_result(f"{title}\n{summary[:900]}\n{url}")
-        except Exception as e:
-            yield event.plain_result(f"Wiki 搜索失败：{e}")
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
+        parts = event.message_str.strip().split(maxsplit=1)
+        if len(parts)<2 or not parts[1].strip():
+            yield event.plain_result("用法：/df <关键词>（命中图文只发图文，否则 DF Wiki；含模糊匹配）"); return
+        raw = parts[1].strip()
+        res = query_flow(raw, star.pack, star.kb, star.cat, star.wiki, star.resolver)
+        if res["type"]=="chain": yield event.chain_result(res["data"])
+        else: yield event.plain_result(res["data"])
 
     @staticmethod
-    @filter.command("df.wiki")
-    async def cmd_wiki(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result("插件尚未初始化完成。")
-            return
-        q = event.message_str.strip().split(maxsplit=1)
-        if len(q) < 2:
-            yield event.plain_result("用法：/df.wiki <关键词或标题>")
-            return
-        keyword = q[1].strip()
-        try:
-            items = star.wiki.search(keyword, limit=int(star.config.get("wiki_limit", 5)))
-            if not items:
-                yield event.plain_result("没有搜索到相关条目。")
-                return
-            title = items[0]["title"]
-            summary, url = star.wiki.page_summary(title)
-            yield event.plain_result(f"{title}\n{summary[:900]}\n{url}")
-        except Exception as e:
-            yield event.plain_result(f"Wiki 调用失败：{e}")
+    @filter.command("df.reg")
+    async def cmd_reg(event: AstrMessageEvent):
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
+        s = event.message_str.split(" ",1)
+        if len(s)<2: yield event.plain_result("用法：/df.reg <别名> -> <目标>"); return
+        line = s[1].strip()
+        if "->" not in line: yield event.plain_result("格式应为：/df.reg 别名 -> 目标"); return
+        alias, target = [x.strip() for x in line.split("->",1)]
+        if not alias or not target: yield event.plain_result("别名与目标均不能为空"); return
+        star.cat.add_alias(alias, target); star.resolver._build_index()
+        yield event.plain_result(f"已注册：{alias} → {target}")
 
     @staticmethod
-    @filter.command("df.kb")
-    async def cmd_kb(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result("插件尚未初始化完成。")
-            return
-        q = event.message_str.strip().split(maxsplit=1)
-        if len(q) < 2:
-            yield event.plain_result("用法：/df.kb <关键词>")
-            return
-        keyword = q[1].strip()
-        entry = star.pack.match(keyword)
-        if entry:
-            chain = star.pack.render_chain(entry)
-            yield event.chain_result(chain) if chain else event.plain_result("条目没有内容。")
-            return
-        doc = star.kb.lookup(keyword)
-        if doc:
-            chain = []
-            ans = (doc.get("answer") or "").strip()
-            if ans:
-                chain.append(Comp.Plain(ans))
-            img = (doc.get("image") or "").strip()
-            if img:
-                if img.startswith("http"):
-                    chain.append(Comp.Image.fromURL(img))
-                else:
-                    local = _abspath("assets", "images", img) if not os.path.isabs(img) else img
-                    if os.path.exists(local):
-                        chain.append(Comp.Image.fromFileSystem(local))
-            yield event.chain_result(chain) if chain else event.plain_result("KB 命中但无内容。")
-            return
-        yield event.plain_result("未命中内容包/KB。")
+    @filter.command("df.rm")
+    async def cmd_rm(event: AstrMessageEvent):
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
+        s = event.message_str.split(" ",1)
+        if len(s)<2 or not s[1].strip(): yield event.plain_result("用法：/df.rm <别名>"); return
+        alias = s[1].strip(); star.cat.remove_alias(alias); star.resolver._build_index()
+        yield event.plain_result(f"已移除别名：{alias}")
 
     @staticmethod
-    @filter.command("dfcfg")
-    async def cmd_cfg(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result("插件尚未初始化完成。")
-        else:
-            cfg = star.config
-            pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
-            mode = cfg.get("wiki_mode","mediawiki")
-            lang = cfg.get("wiki_lang","en")
-            mw_host = cfg.get("mw_host","dwarffortresswiki.org")
-            mw_path = cfg.get("mw_path_prefix","")
-            kb_entries = len(star.kb.entries)
-            pack_entries = len(star.pack.by_key)
-            yield event.plain_result(f"pack_dir={pack_dir}\nwiki={mode}/{lang}/{mw_host}/{mw_path or '-'}\npack={pack_entries} 条, kb={kb_entries} 条")
+    @filter.command("df.cat")
+    async def cmd_cat(event: AstrMessageEvent):
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
+        if not star.cat.aliases: yield event.plain_result("目录为空"); return
+        pairs = [f"{a} -> {b}" for a,b in sorted(star.cat.aliases.items())]
+        yield event.plain_result("已注册别名：\n" + "\n".join(pairs))
 
     @staticmethod
     @filter.command("df.sync")
     async def cmd_sync(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result("插件尚未初始化完成。")
-            return
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
         try:
             star.pack.reload()
+            star.resolver._build_index()
             yield event.plain_result(f"内容包已重载：{len(star.pack.by_key)} 条。")
         except Exception as e:
             yield event.plain_result(f"重载失败：{e}")
@@ -533,39 +369,26 @@ class GameGuide(Star):
     @staticmethod
     @filter.command("df.list")
     async def cmd_list(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result("插件尚未初始化完成。")
-            return
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
         parts = event.message_str.strip().split(maxsplit=1)
-        prefix = parts[1].strip().lower() if len(parts) > 1 else ""
+        prefix = parts[1].strip().lower() if len(parts)>1 else ""
         keys = sorted({e.key for e in star.pack.by_key.values()})
-        if prefix:
-            keys = [k for k in keys if k.lower().startswith(prefix)]
+        if prefix: keys=[k for k in keys if k.lower().startswith(prefix)]
         yield event.plain_result("（空）" if not keys else "\n".join(keys))
 
-    # 诊断
+    @staticmethod
+    @filter.command("dfcfg")
+    async def cmd_cfg(event: AstrMessageEvent):
+        star=_STAR
+        if star is None: yield event.plain_result("插件尚未初始化完成。"); return
+        cfg=star.config; pack_dir=cfg.get("pack_dir", _abspath("packs","df"))
+        yield event.plain_result(
+            f"pack_dir={pack_dir}\n"
+            f"wiki={'https' if cfg.get('mw_https', True) else 'http'}://{cfg.get('mw_host','dwarffortresswiki.org')}/{cfg.get('mw_path_prefix','') or '-'}\n"
+            f"pack={len(star.pack.by_key)} 条, kb={len(star.kb.entries)} 条, cat={len(star.cat.aliases)} 别名"
+        )
+
     @staticmethod
     @filter.command("df.ping")
-    async def df_ping(event: AstrMessageEvent):
-        yield event.plain_result("df pong")
-
-    @staticmethod
-    @filter.command("df.where")
-    async def df_where(event: AstrMessageEvent):
-        star = _STAR
-        if star is None:
-            yield event.plain_result(f"__file__={__file__}\npack_dir=?\nentries=?")
-            return
-        cfg = star.config
-        pack_dir = cfg.get("pack_dir", _abspath("packs","df"))
-        count = len(star.pack.by_key)
-        yield event.plain_result(f"__file__={__file__}\npack_dir={pack_dir}\nentries={count}")
-
-    async def terminate(self):
-        try:
-            cfg = self.context.get_config()
-            if hasattr(cfg, "save_config"):
-                cfg.save_config()
-        except Exception:
-            pass
+    async def df_ping(event: AstrMessageEvent): yield event.plain_result("df pong")
