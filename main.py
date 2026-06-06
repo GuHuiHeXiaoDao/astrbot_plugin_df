@@ -627,7 +627,38 @@ class DFKnowledgeBase:
 
         deduped: Dict[str, DFEntry] = {}
         for entry in self.entries:
+            existing = deduped.get(entry.id)
+            if existing is None:
+                deduped[entry.id] = entry
+                continue
+
+            # 同一个词条可能同时存在于 data/entries 和 entries。
+            # 旧逻辑“后加载覆盖前加载”会导致后面的空 images 覆盖前面的有效 images。
+            # 这里保留后加载词条的主体内容，同时合并图片、关键词、标签和视频链接。
+            def merge_unique(first: List[str], second: List[str]) -> List[str]:
+                result: List[str] = []
+                seen: set[str] = set()
+                for value in [*first, *second]:
+                    value = str(value).strip()
+                    if not value or value in seen:
+                        continue
+                    seen.add(value)
+                    result.append(value)
+                return result
+
+            entry.images = merge_unique(entry.images, existing.images)
+            entry.keywords = merge_unique(entry.keywords, existing.keywords)
+            entry.tags = merge_unique(entry.tags, existing.tags)
+            entry.video_urls = merge_unique(entry.video_urls, existing.video_urls)
+
+            if not entry.answer and existing.answer:
+                entry.answer = existing.answer
+
+            if (not entry.author or entry.author == "未署名") and existing.author:
+                entry.author = existing.author
+
             deduped[entry.id] = entry
+
         self.entries = list(deduped.values())
 
         self.loaded_at = time.time()
