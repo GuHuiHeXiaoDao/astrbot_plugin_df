@@ -49,7 +49,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.3.3"
+PLUGIN_VERSION = "1.3.4"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -566,10 +566,6 @@ class DFKnowledgeBase:
                 logger.warning(f"DF Helper: skip entry without title in {source}: {item}")
 
     def _iter_json_sources(self) -> List[Path]:
-        """
-        扫描插件目录 entries/**/*.json。
-        _category.json / category.json 不作为词条加载。
-        """
         sources: List[Path] = []
         seen: set[str] = set()
         def add_file(path: Path) -> None:
@@ -895,36 +891,29 @@ class DFHelperPlugin(Star):
         if not query:
             return
         command = normalize_text(query)
-        if command in {"reload", "重载", "刷新"}:
+        if command in {"reload","重载","刷新"}:
             self.kb.reload()
             self.help_catalog.reload()
-            yield event.plain_result(
-                f"已重载 DF 词条库：{len(self.kb.entries)} 个词条，"
-                f"{len(self.kb.loaded_files)} 个词条 JSON，"
-                f"{len(self.help_catalog.categories)} 个帮助分类。"
-            )
+            yield event.plain_result(f"已重载 DF 词条库：{len(self.kb.entries)} 个词条，{len(self.kb.loaded_files)} 个词条 JSON，{len(self.help_catalog.categories)} 个帮助分类。")
             return
         results = self.kb.search(query, top_k=self.top_k, threshold=self.threshold)
         if not results:
             suggestions = self.kb.suggest(query, top_k=self.top_k)
             if suggestions:
                 text = "没有达到命中阈值。你是不是想查：\n"
-                for index, item in enumerate(suggestions, 1):
+                for index,item in enumerate(suggestions,1):
                     entry: DFEntry = item["entry"]
                     text += f"{index}. {entry.title}（相似度 {item['score']}）\n"
-                text += f"\n当前阈值：{self.threshold}。可在后台配置 match_threshold。"
+                text += f"\n当前阈值：{self.threshold}。"
                 yield event.plain_result(text.strip())
             else:
-                yield event.plain_result(
-                    f"没有找到与「{query}」相关的 DF 词条。\n请检查 entries/ 下的词条 JSON 后发送 /df reload。"
-                )
+                yield event.plain_result(f"没有找到与「{query}」相关的 DF 词条。\n请检查 entries/ 下的词条 JSON 后发送 /df reload。")
             return
         best = results[0]
         entry: DFEntry = best["entry"]
-        near = [item for item in results[1:] if item["score"] >= max(self.threshold, best["score"] - 8)]
+        near = [item for item in results[1:] if item["score"]>=max(self.threshold,best["score"]-8)]
         node_name, node_uin = await self._get_bot_forward_identity(event)
-        nodes = self._build_entry_forward_nodes(entry, score=best["score"], reason=best["reason"], near=near,
-                                               node_name=node_name, node_uin=node_uin)
+        nodes = self._build_entry_forward_nodes(entry, score=best["score"], reason=best["reason"], near=near, node_name=node_name, node_uin=node_uin)
         sent = await self._send_onebot_forward(event, nodes)
         if not sent:
             logger.warning("DF Helper: entry forward failed.")
@@ -984,19 +973,11 @@ class DFHelperPlugin(Star):
         image = (image or "").strip()
         if not image:
             return None
-        if image.startswith(("http://", "https://")):
-            return image
-        if image.startswith("file://"):
-            path = Path(image[7:]).expanduser()
-            return path if path.exists() else None
         path = Path(image).expanduser()
         if path.is_absolute():
             return path if path.exists() else None
-        candidates = [PLUGIN_DIR / "assets" / "images" / image, self.image_dir / image]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        return None
+        candidate = PLUGIN_DIR / "assets" / "images" / image
+        return candidate if candidate.exists() else None
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
         resolved = self._resolve_image_path(image)
@@ -1097,29 +1078,18 @@ class DFHelperPlugin(Star):
     ) -> List[Dict[str, Any]]:
         nodes: List[Dict[str, Any]] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
-        text = (
-            f"【DF 查询】{entry.title}{tag_text}\n"
-            f"作者：{entry.author}\n"
-            f"匹配度：{score}｜{reason}\n\n"
-            f"{entry.answer or '该词条还没有填写文字说明。'}"
-        )
+        text = f"【DF 查询】{entry.title}{tag_text}\n作者：{entry.author}\n匹配度：{score}｜{reason}\n\n{entry.answer or '该词条还没有填写文字说明。'}"
         nodes.append(self._make_node(text, name=node_name, uin=node_uin))
-        for index, image in enumerate(self._get_limited_images(entry), 1):
+        for index, image in enumerate(entry.images or [], 1):
             file_value = self._image_to_onebot_file(image)
             if file_value:
                 content = [
-                    {"type": "text", "data": {"text": f"图 {index}"}},
-                    {"type": "image", "data": {"file": file_value}},
+                    {"type":"text","data":{"text":f"图 {index}"}},
+                    {"type":"image","data":{"file":file_value}}
                 ]
             else:
                 content = f"[图片缺失] {image}"
             nodes.append(self._make_node(content, name=node_name, uin=node_uin))
-        if self.max_images > 0 and len(entry.images) > self.max_images:
-            nodes.append(self._make_node(
-                f"图片过多，已发送前 {self.max_images} 张，共 {len(entry.images)} 张。",
-                name=node_name,
-                uin=node_uin
-            ))
         if near:
             text_near = "可能相关：\n"
             for item in near[:4]:
