@@ -1,0 +1,16 @@
+name: "astrbot_plugin_df_helper"
+desc: "Dwarf Fortress / 矮人要塞攻略查询助手"
+help: |
+  指令：
+  - /df 查询词
+  - /df help
+
+  数据目录：
+  优先使用 StarTools.get_data_dir()，避免插件升级覆盖数据。
+
+  词条字段：
+  id / title / author / keywords / tags / answer / images / video_url / video_urls；支持 entries/ 多文件词条；df_entries.json 可不存在
+author: "GuHuiHeDaDao"
+version: "1.1.1"
+repo: "https://github.com/GuHuiHeXiaoDao/astrbot_plugin_df"
+license: "MIT"

@@ -1,0 +1,61 @@
+{
+  "data_file": {
+    "description": "词条数据文件",
+    "type": "string",
+    "default": "df_entries.json",
+    "hint": "可选。相对路径基于 StarTools.get_data_dir() 数据目录；主要用于全局 aliases。不存在也不影响 entries/ 词条搜索。"
+  },
+  "image_dir": {
+    "description": "本地图片目录",
+    "type": "string",
+    "default": "images",
+    "hint": "相对路径基于 StarTools.get_data_dir() 数据目录；也支持绝对路径。"
+  },
+  "match_threshold": {
+    "description": "模糊匹配阈值",
+    "type": "int",
+    "default": 55,
+    "hint": "越低越容易命中，越高越严格。建议 50-65。"
+  },
+  "top_k": {
+    "description": "候选结果数量",
+    "type": "int",
+    "default": 5
+  },
+  "max_images": {
+    "description": "单个词条最多进入合并转发的图片数",
+    "type": "int",
+    "default": 30,
+    "hint": "设置为 0 或负数表示不限制。图片过多可能被 QQ/NapCat 限制。"
+  },
+  "forward_node_name": {
+    "description": "合并转发节点兜底名称",
+    "type": "string",
+    "default": "DF Helper",
+    "hint": "正常会优先使用机器人昵称；只有 get_login_info 失败才使用这里。"
+  },
+  "forward_node_uin": {
+    "description": "合并转发节点兜底 UIN",
+    "type": "string",
+    "default": "10000",
+    "hint": "正常会优先使用机器人 QQ；只有 get_login_info 失败才使用这里。"
+  },
+  "entries_dir": {
+    "description": "拆分词条目录",
+    "type": "string",
+    "default": "entries",
+    "hint": "相对路径基于 StarTools.get_data_dir() 数据目录；用于多人协作，一个词条一个 JSON 文件。"
+  },
+  "help_catalog_file": {
+    "description": "帮助分类总文件",
+    "type": "string",
+    "default": "help_catalog.json",
+    "hint": "相对路径基于 StarTools.get_data_dir() 数据目录；用于维护大分类帮助。"
+  },
+  "help_dir": {
+    "description": "帮助分类拆分目录",
+    "type": "string",
+    "default": "help",
+    "hint": "相对路径基于 StarTools.get_data_dir() 数据目录；支持 help/**/*.json 分散维护帮助分类。"
+  }
+}
