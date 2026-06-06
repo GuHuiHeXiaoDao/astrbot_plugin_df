@@ -19,6 +19,6 @@
     "冶炼"
   ],
   "answer": "游戏中存在三种可冶炼为铁锭的矿石：赤铁矿(hematite)、磁铁矿(magnetite)和褐铁矿(limonite)。\n\n如果想查看其他矿石的详细属性和挖掘后的矿石图样，可以点击左下角的锤子按钮，选择“stone use”（石头用途），再选择“economic stone”（经济性石头），即可查看各类石头的金属含量、用途、是否耐岩浆等特性。其他普通石头也可以在“Other stone”中查看。",
-  "images": [],
+  "images": ["iron_1.jpg","iron_2.jpg","iron_3.png"],
   "video_urls": []
 }
