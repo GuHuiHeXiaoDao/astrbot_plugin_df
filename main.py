@@ -49,7 +49,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -568,9 +568,7 @@ class DFKnowledgeBase:
     def _iter_json_sources(self) -> List[Path]:
         """
         一次性收集所有需要加载的词条 JSON 文件。
-
-        本版本只扫描插件目录 entries/**/*.json。
-        _category.json / category.json 只作为分类元数据，不作为词条加载。
+        只扫描插件目录 entries/**/*.json。
         """
         sources: List[Path] = []
         seen: set[str] = set()
@@ -578,15 +576,12 @@ class DFKnowledgeBase:
         def add_file(path: Path) -> None:
             if path.name in {"_category.json", "category.json"}:
                 return
-
             try:
                 key = str(path.resolve())
             except OSError:
                 key = str(path)
-
             if key in seen:
                 return
-
             seen.add(key)
             sources.append(path)
 
@@ -933,8 +928,11 @@ class DFHelperPlugin(Star):
         """
         处理 /df 查询。
 
-        普通词条查询优先发送一条合并转发聊天记录。
-        如果合并转发失败，只返回错误提示，不再降级成普通图片消息链，避免刷屏。
+        规则：
+        - /df help 继续走原有帮助聊天记录逻辑；
+        - 普通词条查询（如 /df iron）只发送一条一级聊天记录转发；
+        - 不做二级嵌套；
+        - 如果一级聊天记录发送失败，只提示失败，不再降级成一大串普通消息。
         """
         query = (query or "").strip()
         if not query:
@@ -990,9 +988,9 @@ class DFHelperPlugin(Star):
         )
 
         if not sent:
-            logger.warning("DF Helper: forward failed, do not fallback to image chain.")
+            logger.warning("DF Helper: single-level forward failed.")
             yield event.plain_result(
-                "词条已命中，但合并转发发送失败。请检查 NapCat/OneBot 的 send_group_forward_msg 日志。"
+                "词条已命中，但一级聊天记录发送失败。请检查 OneBot/NapCat 转发能力。"
             )
             return
 
@@ -1050,17 +1048,7 @@ class DFHelperPlugin(Star):
     def _resolve_image_path(self, image: str) -> Optional[Path | str]:
         """
         解析图片路径。
-
-        JSON 中建议只写文件名，例如：
-        "images": ["iron_1.jpg", "iron_2.jpg"]
-
-        查找顺序：
-        1. URL；
-        2. file://；
-        3. 绝对路径；
-        4. 插件目录 assets/images；
-        5. 配置 image_dir；
-        6. 兼容旧目录。
+        JSON 里建议只写文件名，图片统一放在 assets/images/。
         """
         image = (image or "").strip()
         if not image:
@@ -1089,7 +1077,7 @@ class DFHelperPlugin(Star):
             if candidate.exists():
                 return candidate
 
-        return PLUGIN_DIR / "assets" / "images" / image
+        return None
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
         """转成 OneBot image file 字段。"""
@@ -1167,16 +1155,6 @@ class DFHelperPlugin(Star):
 
         return fallback_name, fallback_uin
 
-    def _cq_escape(self, value: str) -> str:
-        """CQ 码参数转义。"""
-        return (
-            str(value)
-            .replace("&", "&amp;")
-            .replace("[", "&#91;")
-            .replace("]", "&#93;")
-            .replace(",", "&#44;")
-        )
-
     def _make_node(
         self,
         content: Any,
@@ -1205,18 +1183,12 @@ class DFHelperPlugin(Star):
         """
         构造词条合并转发节点。
 
-        本版本目标：
-        /df iron 只输出一条聊天记录转发，里面包含：
-        - 文字节点；
-        - 图片节点 1；
-        - 图片节点 2；
-        - 图片节点 3；
-        - 可能相关节点。
-
-        关键修复：
-        - 不再把图片作为普通消息链一股脑发出；
-        - 图片节点 content 使用 CQ 码字符串：[CQ:image,file=...]；
-        - 这比 content=[{"type":"image"}] 在部分 NapCat/OneBot 合并转发里更稳定。
+        目标：
+        - /df iron 只发送“一条一级聊天记录”；
+        - 这条聊天记录内部只有普通节点，不做二级嵌套；
+        - 第 1 个节点是文字；
+        - 后续每张图片各占 1 个节点；
+        - 不使用嵌套转发 ID。
         """
         nodes: List[Dict[str, Any]] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
@@ -1231,12 +1203,24 @@ class DFHelperPlugin(Star):
 
         for index, image in enumerate(self._get_limited_images(entry), 1):
             file_value = self._image_to_onebot_file(image)
-
             if file_value:
-                cq_file = self._cq_escape(file_value)
-                content = f"图 {index}\n[CQ:image,file={cq_file}]"
+                content = [
+                    {
+                        "type": "text",
+                        "data": {"text": f"图 {index}"},
+                    },
+                    {
+                        "type": "image",
+                        "data": {"file": file_value},
+                    },
+                ]
             else:
-                content = f"[图片缺失] {image}"
+                content = [
+                    {
+                        "type": "text",
+                        "data": {"text": f"[图片缺失] {image}"},
+                    }
+                ]
 
             nodes.append(self._make_node(content, name=node_name, uin=node_uin))
 
@@ -1255,13 +1239,7 @@ class DFHelperPlugin(Star):
                 near_entry: DFEntry = item["entry"]
                 text_near += f"- {near_entry.title}（{item['score']}）\n"
 
-            nodes.append(
-                self._make_node(
-                    text_near.strip(),
-                    name=node_name,
-                    uin=node_uin,
-                )
-            )
+            nodes.append(self._make_node(text_near.strip(), name=node_name, uin=node_uin))
 
         return nodes
 
