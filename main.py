@@ -15,6 +15,7 @@ AstrBot 插件：DF Helper / 矮人要塞攻略查询助手
 """
 
 from __future__ import annotations
+import base64
 
 import json
 import os
@@ -49,7 +50,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.3.4"
+PLUGIN_VERSION = "1.3.7"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -568,6 +569,7 @@ class DFKnowledgeBase:
     def _iter_json_sources(self) -> List[Path]:
         sources: List[Path] = []
         seen: set[str] = set()
+
         def add_file(path: Path) -> None:
             if path.name in {"_category.json", "category.json"}:
                 return
@@ -579,6 +581,7 @@ class DFKnowledgeBase:
                 return
             seen.add(key)
             sources.append(path)
+
         entries_root = PLUGIN_DIR / "entries"
         if entries_root.exists():
             for path in sorted(entries_root.rglob("*.json")):
@@ -890,34 +893,59 @@ class DFHelperPlugin(Star):
         query = (query or "").strip()
         if not query:
             return
+
         command = normalize_text(query)
-        if command in {"reload","重载","刷新"}:
+        if command in {"reload", "重载", "刷新"}:
             self.kb.reload()
             self.help_catalog.reload()
-            yield event.plain_result(f"已重载 DF 词条库：{len(self.kb.entries)} 个词条，{len(self.kb.loaded_files)} 个词条 JSON，{len(self.help_catalog.categories)} 个帮助分类。")
+            yield event.plain_result(
+                f"已重载 DF 词条库：{len(self.kb.entries)} 个词条，"
+                f"{len(self.kb.loaded_files)} 个词条 JSON，"
+                f"{len(self.help_catalog.categories)} 个帮助分类。"
+            )
             return
+
         results = self.kb.search(query, top_k=self.top_k, threshold=self.threshold)
+
         if not results:
             suggestions = self.kb.suggest(query, top_k=self.top_k)
             if suggestions:
-                text = "没有达到命中阈值。你是不是想查：\n"
-                for index,item in enumerate(suggestions,1):
+                msg = "没有达到命中阈值。你是不是想查：\n"
+                for index, item in enumerate(suggestions, 1):
                     entry: DFEntry = item["entry"]
-                    text += f"{index}. {entry.title}（相似度 {item['score']}）\n"
-                text += f"\n当前阈值：{self.threshold}。"
-                yield event.plain_result(text.strip())
+                    msg += f"{index}. {entry.title}（相似度 {item['score']}）\n"
+                msg += f"\n当前阈值：{self.threshold}。"
+                yield event.plain_result(msg.strip())
             else:
-                yield event.plain_result(f"没有找到与「{query}」相关的 DF 词条。\n请检查 entries/ 下的词条 JSON 后发送 /df reload。")
+                yield event.plain_result(
+                    f"没有找到与「{query}」相关的 DF 词条。\n"
+                    "请检查 entries/ 下的词条 JSON 后发送 /df reload。"
+                )
             return
+
         best = results[0]
         entry: DFEntry = best["entry"]
-        near = [item for item in results[1:] if item["score"]>=max(self.threshold,best["score"]-8)]
+        near = [
+            item for item in results[1:]
+            if item["score"] >= max(self.threshold, best["score"] - 8)
+        ]
+
         node_name, node_uin = await self._get_bot_forward_identity(event)
-        nodes = self._build_entry_forward_nodes(entry, score=best["score"], reason=best["reason"], near=near, node_name=node_name, node_uin=node_uin)
+        nodes = self._build_entry_forward_nodes(
+            entry,
+            score=best["score"],
+            reason=best["reason"],
+            near=near,
+            node_name=node_name,
+            node_uin=node_uin,
+        )
+
         sent = await self._send_onebot_forward(event, nodes)
         if not sent:
             logger.warning("DF Helper: entry forward failed.")
             yield event.plain_result("词条已命中，但聊天记录转发发送失败。请检查 NapCat/OneBot 日志。")
+            return
+
         if entry.video_urls:
             yield event.plain_result(self._format_video_links(entry.video_urls))
 
@@ -973,21 +1001,38 @@ class DFHelperPlugin(Star):
         image = (image or "").strip()
         if not image:
             return None
+
+        if image.startswith(("http://", "https://")):
+            return image
+
         path = Path(image).expanduser()
         if path.is_absolute():
             return path if path.exists() else None
-        candidate = PLUGIN_DIR / "assets" / "images" / image
-        return candidate if candidate.exists() else None
+
+        candidates = [
+            PLUGIN_DIR / "assets" / "images" / image,
+            self.image_dir / image,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
         resolved = self._resolve_image_path(image)
         if resolved is None:
             return None
+
         if isinstance(resolved, str):
             return resolved
-        if resolved.exists():
-            return "file://" + str(resolved.resolve())
-        return None
+
+        try:
+            raw = resolved.read_bytes()
+            encoded = base64.b64encode(raw).decode("ascii")
+            return "base64://" + encoded
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"DF Helper: encode image failed: {resolved}: {exc}")
+            return None
 
     def _get_limited_images(self, entry: DFEntry) -> List[str]:
         """限制单词条进入合并转发的图片数量。"""
@@ -1077,25 +1122,34 @@ class DFHelperPlugin(Star):
         node_uin: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         nodes: List[Dict[str, Any]] = []
+
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
-        text = f"【DF 查询】{entry.title}{tag_text}\n作者：{entry.author}\n匹配度：{score}｜{reason}\n\n{entry.answer or '该词条还没有填写文字说明。'}"
-        nodes.append(self._make_node(text, name=node_name, uin=node_uin))
+        body = (
+            f"【DF 查询】{entry.title}{tag_text}\n"
+            f"作者：{entry.author}\n"
+            f"匹配度：{score}｜{reason}\n\n"
+            f"{entry.answer or '该词条还没有填写文字说明。'}"
+        )
+        nodes.append(self._make_node(body, name=node_name, uin=node_uin))
+
         for index, image in enumerate(entry.images or [], 1):
             file_value = self._image_to_onebot_file(image)
             if file_value:
                 content = [
-                    {"type":"text","data":{"text":f"图 {index}"}},
-                    {"type":"image","data":{"file":file_value}}
+                    {"type": "text", "data": {"text": f"图 {index}"}},
+                    {"type": "image", "data": {"file": file_value}},
                 ]
             else:
                 content = f"[图片缺失] {image}"
             nodes.append(self._make_node(content, name=node_name, uin=node_uin))
+
         if near:
-            text_near = "可能相关：\n"
+            near_text = "可能相关：\n"
             for item in near[:4]:
                 near_entry: DFEntry = item["entry"]
-                text_near += f"- {near_entry.title}（{item['score']}）\n"
-            nodes.append(self._make_node(text_near.strip(), name=node_name, uin=node_uin))
+                near_text += f"- {near_entry.title}（{item['score']}）\n"
+            nodes.append(self._make_node(near_text.strip(), name=node_name, uin=node_uin))
+
         return nodes
 
     def _build_entry_fallback_chain(
