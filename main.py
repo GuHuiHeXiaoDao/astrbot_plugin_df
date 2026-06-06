@@ -49,7 +49,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.2.3"
+PLUGIN_VERSION = "1.2.0"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -568,8 +568,9 @@ class DFKnowledgeBase:
     def _iter_json_sources(self) -> List[Path]:
         """
         一次性收集所有需要加载的词条 JSON 文件。
-        扫描：全局 df_entries.json、StarTools entries、插件 data/entries、插件 entries。
-        _category.json / category.json 只作为分类元数据。
+
+        本版本只扫描插件目录 entries/**/*.json。
+        _category.json / category.json 只作为分类元数据，不作为词条加载。
         """
         sources: List[Path] = []
         seen: set[str] = set()
@@ -577,28 +578,20 @@ class DFKnowledgeBase:
         def add_file(path: Path) -> None:
             if path.name in {"_category.json", "category.json"}:
                 return
+
             try:
                 key = str(path.resolve())
             except OSError:
                 key = str(path)
+
             if key in seen:
                 return
+
             seen.add(key)
             sources.append(path)
 
-        if self.json_path.exists():
-            add_file(self.json_path)
-        else:
-            logger.info("DF Helper: optional index file not found, skipped.")
-
-        scan_dirs: List[Path] = []
-        if self.entries_dir is not None:
-            scan_dirs.append(self.entries_dir)
-        scan_dirs.extend([PLUGIN_DIR / "data" / "entries", PLUGIN_DIR / "entries"])
-
-        for scan_dir in scan_dirs:
-            if not scan_dir.exists():
-                continue
+        scan_dir = PLUGIN_DIR / "entries"
+        if scan_dir.exists():
             for path in sorted(scan_dir.rglob("*.json")):
                 add_file(path)
 
@@ -937,7 +930,12 @@ class DFHelperPlugin(Star):
         self.help_catalog = HelpCatalog(self.help_catalog_file, self.help_dir)
 
     async def _handle_df_query(self, event: AstrMessageEvent, query: str):
-        """处理 /df 查询。"""
+        """
+        处理 /df 查询。
+
+        普通词条查询优先发送一条合并转发聊天记录。
+        如果合并转发失败，只返回错误提示，不再降级成普通图片消息链，避免刷屏。
+        """
         query = (query or "").strip()
         if not query:
             return
@@ -992,15 +990,11 @@ class DFHelperPlugin(Star):
         )
 
         if not sent:
-            logger.warning("DF Helper: forward failed, use fallback chain.")
-            yield event.chain_result(
-                self._build_entry_fallback_chain(
-                    entry,
-                    score=best["score"],
-                    reason=best["reason"],
-                    near=near,
-                )
+            logger.warning("DF Helper: forward failed, do not fallback to image chain.")
+            yield event.plain_result(
+                "词条已命中，但合并转发发送失败。请检查 NapCat/OneBot 的 send_group_forward_msg 日志。"
             )
+            return
 
         if entry.video_urls:
             yield event.plain_result(self._format_video_links(entry.video_urls))
@@ -1055,15 +1049,18 @@ class DFHelperPlugin(Star):
 
     def _resolve_image_path(self, image: str) -> Optional[Path | str]:
         """
-        解析图片路径，支持 URL、绝对路径、旧版 assets/images 和数据目录图片。
+        解析图片路径。
+
+        JSON 中建议只写文件名，例如：
+        "images": ["iron_1.jpg", "iron_2.jpg"]
 
         查找顺序：
-        1. 配置的 image_dir，默认 assets/images；
-        2. 插件目录 assets/images；
-        3. 插件目录 data/assets/images；
-        4. 插件目录 data/images；
-        5. 数据目录 images；
-        6. 数据目录 assets/images。
+        1. URL；
+        2. file://；
+        3. 绝对路径；
+        4. 插件目录 assets/images；
+        5. 配置 image_dir；
+        6. 兼容旧目录。
         """
         image = (image or "").strip()
         if not image:
@@ -1080,8 +1077,8 @@ class DFHelperPlugin(Star):
             return path
 
         candidates = [
-            self.image_dir / image,
             PLUGIN_DIR / "assets" / "images" / image,
+            self.image_dir / image,
             PLUGIN_DIR / "data" / "assets" / "images" / image,
             PLUGIN_DIR / "data" / "images" / image,
             self.data_dir / "images" / image,
@@ -1092,16 +1089,16 @@ class DFHelperPlugin(Star):
             if candidate.exists():
                 return candidate
 
-        return self.image_dir / image
+        return PLUGIN_DIR / "assets" / "images" / image
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
-        """
-        转成 OneBot image file 字段，直接读取 assets/images 文件夹。
-        """
+        """转成 OneBot image file 字段。"""
         resolved = self._resolve_image_path(image)
         if resolved is None:
-            # fallback to assets/images
-            resolved = PLUGIN_DIR / "assets" / "images" / image
+            return None
+
+        if isinstance(resolved, str):
+            return resolved
 
         if resolved.exists():
             return "file://" + str(resolved.resolve())
@@ -1170,6 +1167,16 @@ class DFHelperPlugin(Star):
 
         return fallback_name, fallback_uin
 
+    def _cq_escape(self, value: str) -> str:
+        """CQ 码参数转义。"""
+        return (
+            str(value)
+            .replace("&", "&amp;")
+            .replace("[", "&#91;")
+            .replace("]", "&#93;")
+            .replace(",", "&#44;")
+        )
+
     def _make_node(
         self,
         content: Any,
@@ -1195,7 +1202,22 @@ class DFHelperPlugin(Star):
         node_name: Optional[str] = None,
         node_uin: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """构造词条合并转发节点。"""
+        """
+        构造词条合并转发节点。
+
+        本版本目标：
+        /df iron 只输出一条聊天记录转发，里面包含：
+        - 文字节点；
+        - 图片节点 1；
+        - 图片节点 2；
+        - 图片节点 3；
+        - 可能相关节点。
+
+        关键修复：
+        - 不再把图片作为普通消息链一股脑发出；
+        - 图片节点 content 使用 CQ 码字符串：[CQ:image,file=...]；
+        - 这比 content=[{"type":"image"}] 在部分 NapCat/OneBot 合并转发里更稳定。
+        """
         nodes: List[Dict[str, Any]] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
 
@@ -1209,17 +1231,10 @@ class DFHelperPlugin(Star):
 
         for index, image in enumerate(self._get_limited_images(entry), 1):
             file_value = self._image_to_onebot_file(image)
+
             if file_value:
-                content = [
-                    {
-                        "type": "text",
-                        "data": {"text": f"图 {index}"},
-                    },
-                    {
-                        "type": "image",
-                        "data": {"file": file_value},
-                    },
-                ]
+                cq_file = self._cq_escape(file_value)
+                content = f"图 {index}\n[CQ:image,file={cq_file}]"
             else:
                 content = f"[图片缺失] {image}"
 
@@ -1297,23 +1312,8 @@ class DFHelperPlugin(Star):
 
     def _entries_root_candidates(self) -> List[Path]:
         """entries 目录候选列表，用于 /df help 自动归类。"""
-        candidates: List[Path] = []
-        if getattr(self, "entries_dir", None) is not None:
-            candidates.append(self.entries_dir)
-        candidates.extend([PLUGIN_DIR / "data" / "entries", PLUGIN_DIR / "entries"])
-
-        result: List[Path] = []
-        seen: set[str] = set()
-        for item in candidates:
-            try:
-                key = str(item.resolve())
-            except OSError:
-                key = str(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(item)
-        return result
+        root = PLUGIN_DIR / "entries"
+        return [root] if root.exists() else []
 
     def _read_category_meta(self, folder: Path) -> Dict[str, Any]:
         """读取 _category.json / category.json。"""
