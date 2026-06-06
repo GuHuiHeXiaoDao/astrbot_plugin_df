@@ -49,7 +49,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.3"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -1095,13 +1095,13 @@ class DFHelperPlugin(Star):
         return self.image_dir / image
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
-        """转成 OneBot image file 字段。"""
+        """
+        转成 OneBot image file 字段，直接读取 assets/images 文件夹。
+        """
         resolved = self._resolve_image_path(image)
         if resolved is None:
-            return None
-
-        if isinstance(resolved, str):
-            return resolved
+            # fallback to assets/images
+            resolved = PLUGIN_DIR / "assets" / "images" / image
 
         if resolved.exists():
             return "file://" + str(resolved.resolve())
