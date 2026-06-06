@@ -49,7 +49,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.3.1"
+PLUGIN_VERSION = "1.3.3"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -567,12 +567,11 @@ class DFKnowledgeBase:
 
     def _iter_json_sources(self) -> List[Path]:
         """
-        一次性收集所有需要加载的词条 JSON 文件。
-        只扫描插件目录 entries/**/*.json。
+        扫描插件目录 entries/**/*.json。
+        _category.json / category.json 不作为词条加载。
         """
         sources: List[Path] = []
         seen: set[str] = set()
-
         def add_file(path: Path) -> None:
             if path.name in {"_category.json", "category.json"}:
                 return
@@ -584,12 +583,10 @@ class DFKnowledgeBase:
                 return
             seen.add(key)
             sources.append(path)
-
         entries_root = PLUGIN_DIR / "entries"
         if entries_root.exists():
             for path in sorted(entries_root.rglob("*.json")):
                 add_file(path)
-
         return sources
 
     def reload(self) -> None:
@@ -615,38 +612,7 @@ class DFKnowledgeBase:
 
         deduped: Dict[str, DFEntry] = {}
         for entry in self.entries:
-            existing = deduped.get(entry.id)
-            if existing is None:
-                deduped[entry.id] = entry
-                continue
-
-            # 同一个词条可能同时存在于 data/entries 和 entries。
-            # 旧逻辑“后加载覆盖前加载”会导致后面的空 images 覆盖前面的有效 images。
-            # 这里保留后加载词条的主体内容，同时合并图片、关键词、标签和视频链接。
-            def merge_unique(first: List[str], second: List[str]) -> List[str]:
-                result: List[str] = []
-                seen: set[str] = set()
-                for value in [*first, *second]:
-                    value = str(value).strip()
-                    if not value or value in seen:
-                        continue
-                    seen.add(value)
-                    result.append(value)
-                return result
-
-            entry.images = merge_unique(entry.images, existing.images)
-            entry.keywords = merge_unique(entry.keywords, existing.keywords)
-            entry.tags = merge_unique(entry.tags, existing.tags)
-            entry.video_urls = merge_unique(entry.video_urls, existing.video_urls)
-
-            if not entry.answer and existing.answer:
-                entry.answer = existing.answer
-
-            if (not entry.author or entry.author == "未署名") and existing.author:
-                entry.author = existing.author
-
             deduped[entry.id] = entry
-
         self.entries = list(deduped.values())
 
         self.loaded_at = time.time()
@@ -925,23 +891,9 @@ class DFHelperPlugin(Star):
         self.help_catalog = HelpCatalog(self.help_catalog_file, self.help_dir)
 
     async def _handle_df_query(self, event: AstrMessageEvent, query: str):
-        """
-        处理 /df 查询。
-
-        /df help 的发送路径是：
-        - _build_help_forward_nodes(...)
-        - _send_onebot_forward(event, nodes)
-
-        本函数对 /df 查询词条使用同样路径：
-        - _build_entry_forward_nodes(...)
-        - _send_onebot_forward(event, nodes)
-
-        因此 /df iron 应只出现一条一级聊天记录。
-        """
         query = (query or "").strip()
         if not query:
             return
-
         command = normalize_text(query)
         if command in {"reload", "重载", "刷新"}:
             self.kb.reload()
@@ -952,13 +904,7 @@ class DFHelperPlugin(Star):
                 f"{len(self.help_catalog.categories)} 个帮助分类。"
             )
             return
-
-        results = self.kb.search(
-            query,
-            top_k=self.top_k,
-            threshold=self.threshold,
-        )
-
+        results = self.kb.search(query, top_k=self.top_k, threshold=self.threshold)
         if not results:
             suggestions = self.kb.suggest(query, top_k=self.top_k)
             if suggestions:
@@ -970,37 +916,19 @@ class DFHelperPlugin(Star):
                 yield event.plain_result(text.strip())
             else:
                 yield event.plain_result(
-                    f"没有找到与「{query}」相关的 DF 词条。\n"
-                    "请检查 entries/ 下的词条 JSON 后发送 /df reload。"
+                    f"没有找到与「{query}」相关的 DF 词条。\n请检查 entries/ 下的词条 JSON 后发送 /df reload。"
                 )
             return
-
         best = results[0]
         entry: DFEntry = best["entry"]
-        near = [
-            item
-            for item in results[1:]
-            if item["score"] >= max(self.threshold, best["score"] - 8)
-        ]
-
+        near = [item for item in results[1:] if item["score"] >= max(self.threshold, best["score"] - 8)]
         node_name, node_uin = await self._get_bot_forward_identity(event)
-        nodes = self._build_entry_forward_nodes(
-            entry,
-            score=best["score"],
-            reason=best["reason"],
-            near=near,
-            node_name=node_name,
-            node_uin=node_uin,
-        )
-
+        nodes = self._build_entry_forward_nodes(entry, score=best["score"], reason=best["reason"], near=near,
+                                               node_name=node_name, node_uin=node_uin)
         sent = await self._send_onebot_forward(event, nodes)
         if not sent:
             logger.warning("DF Helper: entry forward failed.")
-            yield event.plain_result(
-                "词条已命中，但聊天记录转发发送失败。请检查 NapCat/OneBot 日志。"
-            )
-            return
-
+            yield event.plain_result("词条已命中，但聊天记录转发发送失败。请检查 NapCat/OneBot 日志。")
         if entry.video_urls:
             yield event.plain_result(self._format_video_links(entry.video_urls))
 
@@ -1053,55 +981,31 @@ class DFHelperPlugin(Star):
         return "\n".join(lines)
 
     def _resolve_image_path(self, image: str) -> Optional[Path | str]:
-        """
-        解析图片路径。
-
-        推荐用法：
-        - JSON images 里只写文件名，例如 iron_1.jpg；
-        - 图片放在插件目录 assets/images/。
-        """
         image = (image or "").strip()
         if not image:
             return None
-
         if image.startswith(("http://", "https://")):
             return image
-
         if image.startswith("file://"):
             path = Path(image[7:]).expanduser()
             return path if path.exists() else None
-
         path = Path(image).expanduser()
         if path.is_absolute():
             return path if path.exists() else None
-
-        candidates = [
-            PLUGIN_DIR / "assets" / "images" / image,
-            self.image_dir / image,
-            PLUGIN_DIR / "data" / "assets" / "images" / image,
-            PLUGIN_DIR / "data" / "images" / image,
-            self.data_dir / "images" / image,
-            self.data_dir / "assets" / "images" / image,
-        ]
-
+        candidates = [PLUGIN_DIR / "assets" / "images" / image, self.image_dir / image]
         for candidate in candidates:
             if candidate.exists():
                 return candidate
-
         return None
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
-        """转成 OneBot image file 字段。"""
         resolved = self._resolve_image_path(image)
         if resolved is None:
             return None
-
         if isinstance(resolved, str):
             return resolved
-
         if resolved.exists():
             return "file://" + str(resolved.resolve())
-
         return None
 
     def _get_limited_images(self, entry: DFEntry) -> List[str]:
@@ -1191,20 +1095,8 @@ class DFHelperPlugin(Star):
         node_name: Optional[str] = None,
         node_uin: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        构造 /df 查询词条的一级合并转发节点。
-
-        结构固定为：
-        - 节点 1：词条正文；
-        - 节点 2..N：图片，每张图片一个普通节点；
-        - 最后：可能相关节点。
-
-        这里完全复用 /df help 的发送路径：nodes -> _send_onebot_forward。
-        不做二级嵌套，不使用 resid / forward_id，不返回普通消息链。
-        """
         nodes: List[Dict[str, Any]] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
-
         text = (
             f"【DF 查询】{entry.title}{tag_text}\n"
             f"作者：{entry.author}\n"
@@ -1212,49 +1104,28 @@ class DFHelperPlugin(Star):
             f"{entry.answer or '该词条还没有填写文字说明。'}"
         )
         nodes.append(self._make_node(text, name=node_name, uin=node_uin))
-
         for index, image in enumerate(self._get_limited_images(entry), 1):
             file_value = self._image_to_onebot_file(image)
-
             if file_value:
                 content = [
-                    {
-                        "type": "text",
-                        "data": {"text": f"图 {index}"},
-                    },
-                    {
-                        "type": "image",
-                        "data": {"file": file_value},
-                    },
+                    {"type": "text", "data": {"text": f"图 {index}"}},
+                    {"type": "image", "data": {"file": file_value}},
                 ]
             else:
                 content = f"[图片缺失] {image}"
-
             nodes.append(self._make_node(content, name=node_name, uin=node_uin))
-
         if self.max_images > 0 and len(entry.images) > self.max_images:
-            nodes.append(
-                self._make_node(
-                    f"图片过多，已发送前 {self.max_images} 张，共 {len(entry.images)} 张。",
-                    name=node_name,
-                    uin=node_uin,
-                )
-            )
-
+            nodes.append(self._make_node(
+                f"图片过多，已发送前 {self.max_images} 张，共 {len(entry.images)} 张。",
+                name=node_name,
+                uin=node_uin
+            ))
         if near:
             text_near = "可能相关：\n"
             for item in near[:4]:
                 near_entry: DFEntry = item["entry"]
                 text_near += f"- {near_entry.title}（{item['score']}）\n"
-
-            nodes.append(
-                self._make_node(
-                    text_near.strip(),
-                    name=node_name,
-                    uin=node_uin,
-                )
-            )
-
+            nodes.append(self._make_node(text_near.strip(), name=node_name, uin=node_uin))
         return nodes
 
     def _build_entry_fallback_chain(
@@ -1264,10 +1135,7 @@ class DFHelperPlugin(Star):
         reason: str,
         near: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Any]:
-        """
-        合并转发失败时的最低限度降级。
-        为避免刷屏，这里不再发送图片。
-        """
+        """合并转发失败时的普通消息链降级。"""
         chain: List[Any] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
 
@@ -1275,10 +1143,25 @@ class DFHelperPlugin(Star):
             f"【DF 查询】{entry.title}{tag_text}\n"
             f"作者：{entry.author}\n"
             f"匹配度：{score}｜{reason}\n\n"
-            f"{entry.answer or '该词条还没有填写文字说明。'}\n\n"
-            "注意：聊天记录转发失败，因此未发送图片。"
+            f"{entry.answer or '该词条还没有填写文字说明。'}"
         )
         chain.append(Comp.Plain(text))
+
+        for image in self._get_limited_images(entry):
+            resolved = self._resolve_image_path(image)
+            if resolved is None:
+                continue
+
+            try:
+                if isinstance(resolved, str):
+                    chain.append(Comp.Image.fromURL(resolved))
+                elif resolved.exists():
+                    chain.append(Comp.Image.fromFileSystem(str(resolved)))
+                else:
+                    chain.append(Comp.Plain(f"\n[图片缺失] {resolved}"))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"DF Helper: send fallback image failed: {exc}")
+                chain.append(Comp.Plain(f"\n[图片发送失败] {image}: {exc}"))
 
         if near:
             text_near = "\n\n可能相关：\n"
@@ -1291,7 +1174,6 @@ class DFHelperPlugin(Star):
         return chain
 
     def _entries_root_candidates(self) -> List[Path]:
-        """entries 目录候选列表，用于 /df help 自动归类。"""
         root = PLUGIN_DIR / "entries"
         return [root] if root.exists() else []
 
