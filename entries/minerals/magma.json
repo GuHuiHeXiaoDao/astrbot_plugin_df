@@ -14,6 +14,6 @@
     "冶炼"
   ],
   "answer": "岩浆是一种热源,在4/7液位的岩浆上放置岩浆工坊可以充当能源,可以利用pump或者矿车(必须由magma-safe材质制作)等方式获取岩浆,一单位的矿车是2/7液位的岩浆\n可以融毁一切非magma-safe的零部件(包括安装在装置上的齿轮)\n与水混合可以产生黑曜石,岩浆在1/7液位会蒸发",
-  "images": ["magma_1.jpg"],
+  "images": ["magma_1.jpg","magma_2.png"],
   "video_urls": ["https://www.bilibili.com/video/BV1V84y1871x","https://www.bilibili.com/video/BV1AP4y1v7AA","https://www.bilibili.com/opus/740291305053093890"]
 }
