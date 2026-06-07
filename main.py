@@ -16,6 +16,7 @@ AstrBot 插件：DF Helper / 矮人要塞攻略查询助手
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -49,7 +50,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.2.6"
+PLUGIN_VERSION = "1.3.9"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -501,7 +502,15 @@ class DFEntry:
             id=entry_id,
             title=title,
             keywords=[str(item).strip() for item in keywords if str(item).strip()],
-            answer=render_text(data.get("answer", data.get("desc", ""))).strip(),
+            answer=render_text(
+                data.get(
+                    "answer",
+                    data.get(
+                        "text",
+                        data.get("content", data.get("description", data.get("desc", ""))),
+                    ),
+                )
+            ).strip(),
             images=[str(item).strip() for item in images if str(item).strip()],
             tags=[str(item).strip() for item in tags if str(item).strip()],
             author=str(data.get("author", "未署名")).strip() or "未署名",
@@ -566,43 +575,26 @@ class DFKnowledgeBase:
                 logger.warning(f"DF Helper: skip entry without title in {source}: {item}")
 
     def _iter_json_sources(self) -> List[Path]:
-        """
-        一次性收集所有需要加载的词条 JSON 文件。
-
-        本版本只扫描：
-        - 插件目录 entries/**/*.json
-
-        说明：
-        - _category.json / category.json 只作为分类元数据，不作为词条加载；
-        - 不再扫描 data/entries，避免同 ID 词条重复覆盖；
-        - 可选 df_entries.json 仍保留作为全局 aliases/兼容入口。
-        """
+        """只扫描插件目录 entries/**/*.json。"""
         sources: List[Path] = []
         seen: set[str] = set()
 
         def add_file(path: Path) -> None:
             if path.name in {"_category.json", "category.json"}:
                 return
-
             try:
                 key = str(path.resolve())
             except OSError:
                 key = str(path)
-
             if key in seen:
                 return
-
             seen.add(key)
             sources.append(path)
 
-        scan_dir = PLUGIN_DIR / "entries"
-        if scan_dir.exists():
-            for path in sorted(scan_dir.rglob("*.json")):
+        entries_root = PLUGIN_DIR / "entries"
+        if entries_root.exists():
+            for path in sorted(entries_root.rglob("*.json")):
                 add_file(path)
-
-        # 可选全局别名文件，建议只用于 aliases；没有也不影响 entries/ 分布式词条。
-        if self.json_path.exists():
-            add_file(self.json_path)
 
         return sources
 
@@ -911,11 +903,10 @@ class DFHelperPlugin(Star):
         """
         处理 /df 查询。
 
-        注意：
-        - /df help 仍由 _send_forward_help 走合并转发；
-        - 普通词条查询不再使用 _send_entry_forward；
-        - 原因是 NapCat/OneBot 对“合并转发节点里的本地图片”兼容不稳定；
-        - 这里改用普通消息链输出：文字 + 图片，图片从 assets/images/ 读取。
+        要求：
+        - 最终输出只有一条聊天记录；
+        - 成功后不 yield 普通文字/图片；
+        - 失败时只给一条错误提示。
         """
         query = (query or "").strip()
         if not query:
@@ -932,21 +923,16 @@ class DFHelperPlugin(Star):
             )
             return
 
-        results = self.kb.search(
-            query,
-            top_k=self.top_k,
-            threshold=self.threshold,
-        )
-
+        results = self.kb.search(query, top_k=self.top_k, threshold=self.threshold)
         if not results:
             suggestions = self.kb.suggest(query, top_k=self.top_k)
             if suggestions:
-                text = "没有达到命中阈值。你是不是想查：\n"
+                msg = "没有达到命中阈值。你是不是想查：\n"
                 for index, item in enumerate(suggestions, 1):
                     entry: DFEntry = item["entry"]
-                    text += f"{index}. {entry.title}（相似度 {item['score']}）\n"
-                text += f"\n当前阈值：{self.threshold}。可在后台配置 match_threshold。"
-                yield event.plain_result(text.strip())
+                    msg += f"{index}. {entry.title}（相似度 {item['score']}）\n"
+                msg += f"\n当前阈值：{self.threshold}。"
+                yield event.plain_result(msg.strip())
             else:
                 yield event.plain_result(
                     f"没有找到与「{query}」相关的 DF 词条。\n"
@@ -957,25 +943,34 @@ class DFHelperPlugin(Star):
         best = results[0]
         entry: DFEntry = best["entry"]
         near = [
-            item
-            for item in results[1:]
+            item for item in results[1:]
             if item["score"] >= max(self.threshold, best["score"] - 8)
         ]
 
-        yield event.chain_result(
-            self._build_entry_fallback_chain(
-                entry,
-                score=best["score"],
-                reason=best["reason"],
-                near=near,
-            )
+        # 合并转发节点名称按词条 author 显示；uin 仍使用机器人 QQ，避免头像异常。
+        _, node_uin = await self._get_bot_forward_identity(event)
+        nodes = self._build_entry_forward_nodes(
+            entry,
+            score=best["score"],
+            reason=best["reason"],
+            near=near,
+            node_name=entry.author,
+            node_uin=node_uin,
         )
+
+        sent = await self._send_onebot_forward(event, nodes)
+        if not sent:
+            logger.warning("DF Helper: entry forward failed.")
+            yield event.plain_result(
+                "词条已命中，但聊天记录转发发送失败。请检查 NapCat/OneBot 日志。"
+            )
+            return
 
         if entry.video_urls:
             yield event.plain_result(self._format_video_links(entry.video_urls))
 
     def _format_entry_list(self) -> str:
-        """格式化词条列表，不显示服务器本地路径。"""
+        """格式化词条列表。"""
         if not self.kb.entries:
             return "当前词条库为空。"
 
@@ -989,7 +984,16 @@ class DFHelperPlugin(Star):
         if len(self.kb.entries) > 80:
             lines.append(f"... 还有 {len(self.kb.entries) - 80} 个未显示。")
 
-        lines.append(f"\n已加载词条 JSON 文件数：{len(self.kb.loaded_files)}")
+        lines.append(f"\n全局别名文件（可选）：{self.data_file}")
+        lines.append(f"拆分词条目录：{self.entries_dir}")
+        lines.append(f"图片目录：{self.image_dir}")
+        lines.append(f"兼容旧图片目录：{PLUGIN_DIR / 'assets' / 'images'}")
+        lines.append(f"兼容旧数据图片目录：{PLUGIN_DIR / 'data' / 'assets' / 'images'}")
+        lines.append(f"已一次性加载 JSON 文件数：{len(self.kb.loaded_files)}")
+        for path in self.kb.loaded_files[:10]:
+            lines.append(f"- {path}")
+        if len(self.kb.loaded_files) > 10:
+            lines.append(f"... 还有 {len(self.kb.loaded_files) - 10} 个文件未显示。")
         return "\n".join(lines)
 
     def _format_help_text(self) -> str:
@@ -1017,18 +1021,11 @@ class DFHelperPlugin(Star):
         """
         解析图片路径。
 
-        目标用法：
-        - JSON 中只写文件名，例如 "iron_1.jpg"；
-        - 图片文件放在 assets/images/；
-        - /df 查询时使用 Comp.Image.fromFileSystem 发送本地图片。
+        JSON 中建议只写文件名，例如：
+        "images": ["iron_1.jpg", "iron_2.jpg"]
 
-        查找顺序：
-        1. http/https URL；
-        2. file:// 本地路径；
-        3. 绝对路径；
-        4. 插件目录 assets/images；
-        5. 配置的 image_dir；
-        6. 少量兼容旧目录。
+        本地图片固定读取：
+        assets/images/
         """
         image = (image or "").strip()
         if not image:
@@ -1045,23 +1042,21 @@ class DFHelperPlugin(Star):
         if path.is_absolute():
             return path if path.exists() else None
 
-        candidates = [
-            PLUGIN_DIR / "assets" / "images" / image,
-            self.image_dir / image,
-            PLUGIN_DIR / "data" / "assets" / "images" / image,
-            PLUGIN_DIR / "data" / "images" / image,
-            self.data_dir / "images" / image,
-            self.data_dir / "assets" / "images" / image,
-        ]
-
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-        return None
+        candidate = PLUGIN_DIR / "assets" / "images" / image
+        return candidate if candidate.exists() else None
 
     def _image_to_onebot_file(self, image: str) -> Optional[str]:
-        """转成 OneBot image file 字段。"""
+        """
+        转成 OneBot image file 字段。
+
+        本地图片：
+        - AstrBot 从 assets/images 读取；
+        - 转成 base64://；
+        - NapCat 不再需要读取本地路径。
+
+        URL 图片：
+        - 原样返回。
+        """
         resolved = self._resolve_image_path(image)
         if resolved is None:
             return None
@@ -1069,10 +1064,13 @@ class DFHelperPlugin(Star):
         if isinstance(resolved, str):
             return resolved
 
-        if resolved.exists():
-            return "file://" + str(resolved.resolve())
-
-        return None
+        try:
+            raw = resolved.read_bytes()
+            encoded = base64.b64encode(raw).decode("ascii")
+            return "base64://" + encoded
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"DF Helper: encode image failed: {resolved}: {exc}")
+            return None
 
     def _get_limited_images(self, entry: DFEntry) -> List[str]:
         """限制单词条进入合并转发的图片数量。"""
@@ -1161,58 +1159,63 @@ class DFHelperPlugin(Star):
         node_name: Optional[str] = None,
         node_uin: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """构造词条合并转发节点。"""
+        """
+        构造 /df 查询词的一级合并转发节点。
+
+        最终只发送一条聊天记录：
+        - 节点 1：文字说明；
+        - 节点 2..N：按 JSON images 数组顺序逐张发送图片；
+        - 节点名称：优先使用词条 author。
+
+        注意：这里不把“可能相关”塞进命中的合并转发，避免查询成功后出现额外无关节点。
+        """
         nodes: List[Dict[str, Any]] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
+        author_name = (entry.author or node_name or self.forward_node_name or "DF Helper").strip()
 
-        text = (
+        body = (
             f"【DF 查询】{entry.title}{tag_text}\n"
             f"作者：{entry.author}\n"
             f"匹配度：{score}｜{reason}\n\n"
             f"{entry.answer or '该词条还没有填写文字说明。'}"
         )
-        nodes.append(self._make_node(text, name=node_name, uin=node_uin))
+        nodes.append(
+            self._make_node(
+                [{"type": "text", "data": {"text": body}}],
+                name=author_name,
+                uin=node_uin,
+            )
+        )
 
         for index, image in enumerate(self._get_limited_images(entry), 1):
             file_value = self._image_to_onebot_file(image)
             if file_value:
                 content = [
-                    {
-                        "type": "text",
-                        "data": {"text": f"图 {index}"},
-                    },
-                    {
-                        "type": "image",
-                        "data": {"file": file_value},
-                    },
+                    {"type": "text", "data": {"text": f"图 {index}\n"}},
+                    {"type": "image", "data": {"file": file_value}},
                 ]
             else:
-                content = f"[图片缺失] {image}"
-
-            nodes.append(self._make_node(content, name=node_name, uin=node_uin))
+                content = [
+                    {"type": "text", "data": {"text": f"[图片缺失] {image}"}}
+                ]
+            nodes.append(self._make_node(content, name=author_name, uin=node_uin))
 
         if self.max_images > 0 and len(entry.images) > self.max_images:
             nodes.append(
                 self._make_node(
-                    f"图片过多，已发送前 {self.max_images} 张，共 {len(entry.images)} 张。",
-                    name=node_name,
+                    [
+                        {
+                            "type": "text",
+                            "data": {
+                                "text": f"图片过多，已发送前 {self.max_images} 张，共 {len(entry.images)} 张。"
+                            },
+                        }
+                    ],
+                    name=author_name,
                     uin=node_uin,
                 )
             )
 
-        if near:
-            text_near = "可能相关：\n"
-            for item in near[:4]:
-                near_entry: DFEntry = item["entry"]
-                text_near += f"- {near_entry.title}（{item['score']}）\n"
-
-            nodes.append(
-                self._make_node(
-                    text_near.strip(),
-                    name=node_name,
-                    uin=node_uin,
-                )
-            )
 
         return nodes
 
@@ -1223,18 +1226,7 @@ class DFHelperPlugin(Star):
         reason: str,
         near: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Any]:
-        """
-        构造词条普通消息链。
-
-        最终输出：
-        1. 查询文字；
-        2. 按 entry.images 顺序发送 assets/images/ 下的图片；
-        3. 可能相关候选。
-
-        说明：
-        - 这不依赖 OneBot 合并转发中的 image 节点；
-        - 使用 AstrBot 的 Comp.Image.fromFileSystem，等价于早期稳定可发图的方式。
-        """
+        """合并转发失败时的普通消息链降级。"""
         chain: List[Any] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
 
@@ -1246,33 +1238,21 @@ class DFHelperPlugin(Star):
         )
         chain.append(Comp.Plain(text))
 
-        limited_images = self._get_limited_images(entry)
-        for index, image in enumerate(limited_images, 1):
+        for image in self._get_limited_images(entry):
             resolved = self._resolve_image_path(image)
-
             if resolved is None:
-                chain.append(Comp.Plain(f"\n[图片缺失] {image}"))
                 continue
 
             try:
                 if isinstance(resolved, str):
-                    chain.append(Comp.Plain(f"\n图 {index}"))
                     chain.append(Comp.Image.fromURL(resolved))
                 elif resolved.exists():
-                    chain.append(Comp.Plain(f"\n图 {index}"))
                     chain.append(Comp.Image.fromFileSystem(str(resolved)))
                 else:
-                    chain.append(Comp.Plain(f"\n[图片缺失] {image}"))
+                    chain.append(Comp.Plain(f"\n[图片缺失] {resolved}"))
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"DF Helper: send image failed: {image}: {exc}")
+                logger.warning(f"DF Helper: send fallback image failed: {exc}")
                 chain.append(Comp.Plain(f"\n[图片发送失败] {image}: {exc}"))
-
-        if self.max_images > 0 and len(entry.images) > self.max_images:
-            chain.append(
-                Comp.Plain(
-                    f"\n图片过多，已发送前 {self.max_images} 张，共 {len(entry.images)} 张。"
-                )
-            )
 
         if near:
             text_near = "\n\n可能相关：\n"
@@ -1285,11 +1265,7 @@ class DFHelperPlugin(Star):
         return chain
 
     def _entries_root_candidates(self) -> List[Path]:
-        """
-        /df help 分类根目录。
-
-        本版本只使用插件目录 entries/。
-        """
+        """只使用插件目录 entries/ 作为 /df help 分类根目录。"""
         root = PLUGIN_DIR / "entries"
         return [root] if root.exists() else []
 
@@ -1615,22 +1591,17 @@ class DFHelperPlugin(Star):
         event: AstrMessageEvent,
         nodes: List[Dict[str, Any]],
     ) -> bool:
-        """发送 OneBot 合并转发。"""
+        """
+        发送 OneBot 合并转发。
+
+        只负责发送一条聊天记录。
+        如果失败，返回 False，不把节点展开成普通消息。
+        """
         try:
-            platform = ""
-            try:
-                platform = event.get_platform_name()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"DF Helper: get_platform_name failed: {exc}")
-
-            if platform:
-                platform_lower = platform.lower()
-                if "aiocqhttp" not in platform_lower and "onebot" not in platform_lower:
-                    return False
-
             bot = getattr(event, "bot", None)
             api = getattr(bot, "api", None)
             if api is None:
+                logger.warning("DF Helper: OneBot api unavailable.")
                 return False
 
             group_id = self._get_group_id_from_event(event)
@@ -1644,16 +1615,29 @@ class DFHelperPlugin(Star):
                 base_payload = {"user_id": int(user_id)}
 
             last_error: Optional[Exception] = None
+            last_response: Any = None
+
+            # NapCat 通常吃 messages；部分实现吃 nodes，所以保留双尝试。
             for field_name in ("messages", "nodes"):
                 try:
                     payload = dict(base_payload)
                     payload[field_name] = nodes
-                    await api.call_action(action, **payload)
+                    logger.info(
+                        f"DF Helper: call {action} with {field_name}, nodes={len(nodes)}"
+                    )
+                    response = await api.call_action(action, **payload)
+                    last_response = response
+                    logger.info(f"DF Helper: forward response: {response}")
                     return True
                 except Exception as exc:  # noqa: BLE001
                     last_error = exc
+                    logger.warning(
+                        f"DF Helper: forward failed with field={field_name}: {exc}"
+                    )
 
-            logger.warning(f"DF Helper: forward send failed: {last_error}")
+            logger.warning(
+                f"DF Helper: forward send failed, last_error={last_error}, last_response={last_response}"
+            )
             return False
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -1683,13 +1667,13 @@ class DFHelperPlugin(Star):
         near: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """发送词条合并转发。"""
-        node_name, node_uin = await self._get_bot_forward_identity(event)
+        _, node_uin = await self._get_bot_forward_identity(event)
         nodes = self._build_entry_forward_nodes(
             entry,
             score,
             reason,
             near,
-            node_name=node_name,
+            node_name=entry.author,
             node_uin=node_uin,
         )
         return await self._send_onebot_forward(event, nodes)
