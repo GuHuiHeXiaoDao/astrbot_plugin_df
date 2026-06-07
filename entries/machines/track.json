@@ -1,7 +1,7 @@
 {
   "id": "df_track",
   "title": "轨道",
-  "author": "wiki原文,盗大盒灰骨转载讲解",
+  "author": "wiki原文,盗大盒灰骨转载讲解,ticks参考FI101仿真",
   "keywords": [
     "track",
     "轨道",
@@ -12,7 +12,7 @@
     "教程",
     "轨道"
   ],
-  "answer": "基础的轨道讲解视频，介绍各个功能,包含impulse ramp\ntips:并未涉及进一步的checkpoint和ticks",
+  "answer": "基础的轨道讲解视频，介绍各个功能,包含impulse ramp\ntips:并未涉及进一步的checkpoint",
   "images": ["track.png"],
-  "video_urls": ["https://www.bilibili.com/video/BV1Z8411U749"]
+  "video_urls": ["https://www.bilibili.com/video/BV1Z8411U749","https://www.bilibili.com/video/BV1ms4y1W7Jt"]
 }

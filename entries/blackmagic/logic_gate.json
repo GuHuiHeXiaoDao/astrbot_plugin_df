@@ -1,0 +1,20 @@
+{
+  "id": "df_logic_gate",
+  "title": "逻辑门",
+  "author": "原文来源wiki,盗大盒灰骨讲解",
+  "keywords": [
+    "logic",
+    "logic_gate",
+    "计算器",
+    "数电",
+    "逻辑门"
+  ],
+  "tags": [
+    "黑科技",
+    "数电",
+    "逻辑门"
+  ],
+  "answer": "视频内容为逻辑门在df的初步表现",
+  "images": ["logic.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV1QM4y1a7FQ"]
+}
