@@ -1,0 +1,19 @@
+{
+  "id": "df_cage",
+  "title": "精灵球",
+  "author": "盗大盒灰骨",
+  "keywords": [
+    "宝可梦",
+    "cage",
+    "笼子",
+    "cage trap"
+  ],
+  "tags": [
+    "陷阱",
+    "黑魔法",
+    "邪道"
+  ],
+  "answer": "如果笼子陷阱上存在由gcs(巨型洞穴蜘蛛)喷出的网,可以捕获绝大部分怪物包括FB,龙等\n具体操作是需要将蜘蛛捆缚在一个小房间内,外墙需打磨射击孔,放置仇恨源(比如拴住的狗),让蛛网喷射在cage trap上\ntips:可以用同样的方式制作蛛网农场",
+  "images": ["cage_trap.png","cage_trap1.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV1iu411a7ZE"]
+}
