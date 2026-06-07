@@ -1010,9 +1010,9 @@ class DFHelperPlugin(Star):
     def _format_video_links(self, video_urls: List[str]) -> str:
         """格式化链接。"""
         if len(video_urls) == 1:
-            return f"相关链接：\n{video_urls[0]}"
+            return f"相关链接如下,B站视频链接可以发送GuReiya进行解析：\n{video_urls[0]}"
 
-        lines = ["相关链接："]
+        lines = ["相关链接如下,B站视频链接可以发送GuReiya进行解析："]
         for index, url in enumerate(video_urls, 1):
             lines.append(f"{index}. {url}")
         return "\n".join(lines)
