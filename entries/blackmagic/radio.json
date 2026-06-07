@@ -5,6 +5,7 @@
   "keywords": [
     "无线电通信",
     "无线电",
+    "radio",
     "wifi"
   ],
   "tags": [
@@ -14,5 +15,5 @@
   ],
   "answer": "让玩家代替矮人去拉拉杆,通过取消墙的建筑任务来卡住门，让一直循环行动的矿车脱轨飞出，落在有压力板的深坑内\n让目标装置受到一个信号,并发挥作用，实现手动拉杆的作用。",
   "images": ["radio.png"],
-  "video_urls": ["https://www.bilibili.com/video/BV1snpdejE86"]
+  "video_urls": ["https://www.bilibili.com/video/BV1snpdejE86","https://www.bilibili.com/video/BV1TGsVeBERj"]
 }
