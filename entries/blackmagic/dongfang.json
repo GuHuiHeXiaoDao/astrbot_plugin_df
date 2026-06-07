@@ -1,0 +1,17 @@
+{
+  "id": "df_dongfang",
+  "title": "东方",
+  "author": "盗大盒灰骨",
+  "keywords": [
+    "东方",
+    "dongfang",
+    "原来你也玩df"
+  ],
+  "tags": [
+    "黑魔法",
+    "df"
+  ],
+  "answer": "利用dfhack的pen脚本,并寻找视频的帧文件,理论上可以在df里面播放所有视频",
+  "images": ["dongfang.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV14CQnBNEyq"]
+}
