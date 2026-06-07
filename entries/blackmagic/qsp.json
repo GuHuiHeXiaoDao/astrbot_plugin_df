@@ -1,0 +1,19 @@
+{
+  "id": "df_qsp",
+  "title": "量子存储区",
+  "author": "原文来源wiki,盗大盒灰骨拓展",
+  "keywords": [
+    "qsp",
+    "quantum stockpile",
+    "stockpile",
+    "存储区"
+  ],
+  "tags": [
+    "黑科技",
+    "存储区",
+    "轨道"
+  ],
+  "answer": "qsp(quantum stockpile)量子存储区,作用是为了节省空间\ntips:掌握原理后,可以进行拓展,qdp(quantum dump pile)可以用于垃圾区和高空抛物用于跨楼层运输物资）",
+  "images": ["qsp.png","qdp.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV1eG411K71P"]
+}
