@@ -1,0 +1,19 @@
+{
+  "id": "df_metal_copy",
+  "title": "金属复制",
+  "author": "wiki原文,盗大盒灰骨优化",
+  "keywords": [
+    "金属复制",
+    "复制"
+  ],
+  "tags": [
+    "金属复制",
+    "黑科技",
+    "无限金属",
+    "Infinite metal",
+    "bug"
+  ],
+  "answer": "视频4:45开始,绝大部分材质都可以利用裤衩子复制,仅有精金(adamantine)需要利用coins复制\n 撒币机请查看相关wiki链接",
+  "images": ["copy.png","angry_labor.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV19Z42117AE","https://dwarffortresswiki.org/index.php/Exploit#Infinite_metal","https://www.reddit.com/r/dwarffortress/comments/fql316/infinite_adamantine_using_elf_labor/"]
+}
