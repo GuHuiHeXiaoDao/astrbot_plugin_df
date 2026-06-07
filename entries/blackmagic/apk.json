@@ -1,0 +1,20 @@
+{
+  "id": "df_apk",
+  "title": "手机版下载",
+  "author": "呱皮狗,盗大盒灰骨",
+  "keywords": [
+    "手机版",
+    "手机",
+    "apk",
+    "wine",
+    "winlator"
+  ],
+  "tags": [
+    "手机版下载",
+    "linux",
+    "wine"
+  ],
+  "answer": "呱皮狗方法是通过termux进行编译\n盗大盒灰骨方法是通过winlator,详情请看链接,链接失效请联系up进行更新",
+  "images": ["apk1.png","apk2.png"],
+  "video_urls": ["https://www.bilibili.com/opus/615694569887401091","https://www.bilibili.com/video/BV1y94y1T7vp"]
+}
