@@ -1,0 +1,18 @@
+{
+  "id": "df_track",
+  "title": "轨道",
+  "author": "wiki原文,盗大盒灰骨转载讲解",
+  "keywords": [
+    "track",
+    "轨道",
+    "铁轨",
+    "铁路"
+  ],
+  "tags": [
+    "教程",
+    "轨道"
+  ],
+  "answer": "基础的轨道讲解视频，介绍各个功能,包含impulse ramp\ntips:并未涉及进一步的checkpoint和ticks",
+  "images": ["track.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV1Z8411U749"]
+}
