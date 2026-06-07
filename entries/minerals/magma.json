@@ -1,0 +1,19 @@
+{
+  "id": "df_magma",
+  "title": "岩浆",
+  "author": "盗大盒灰骨",
+  "keywords": [
+    "岩浆",
+    "熔岩",
+    "magma",
+    "lava"
+  ],
+  "tags": [
+    "能源",
+    "科技",
+    "冶炼"
+  ],
+  "answer": "岩浆是一种热源,在4/7液位的岩浆上放置岩浆工坊可以充当能源,可以利用pump或者矿车(必须由magma-safe材质制作)等方式获取岩浆,一单位的矿车是2/7液位的岩浆\n与水混合可以产生黑曜石,可以融毁一切非magma-safe的零部件(包括安装在装置上的齿轮)\n岩浆在1/7液位会蒸发",
+  "images": ["magma_1.jpg"],
+  "video_urls": ["https://www.bilibili.com/video/BV1V84y1871x"]
+}
