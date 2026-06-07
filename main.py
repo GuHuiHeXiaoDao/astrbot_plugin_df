@@ -50,7 +50,7 @@ except ImportError:
 
 
 PLUGIN_NAME = "astrbot_plugin_df_helper"
-PLUGIN_VERSION = "1.3.8"
+PLUGIN_VERSION = "1.3.9"
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 
@@ -502,7 +502,15 @@ class DFEntry:
             id=entry_id,
             title=title,
             keywords=[str(item).strip() for item in keywords if str(item).strip()],
-            answer=render_text(data.get("answer", data.get("desc", ""))).strip(),
+            answer=render_text(
+                data.get(
+                    "answer",
+                    data.get(
+                        "text",
+                        data.get("content", data.get("description", data.get("desc", ""))),
+                    ),
+                )
+            ).strip(),
             images=[str(item).strip() for item in images if str(item).strip()],
             tags=[str(item).strip() for item in tags if str(item).strip()],
             author=str(data.get("author", "未署名")).strip() or "未署名",
@@ -939,13 +947,14 @@ class DFHelperPlugin(Star):
             if item["score"] >= max(self.threshold, best["score"] - 8)
         ]
 
-        node_name, node_uin = await self._get_bot_forward_identity(event)
+        # 合并转发节点名称按词条 author 显示；uin 仍使用机器人 QQ，避免头像异常。
+        _, node_uin = await self._get_bot_forward_identity(event)
         nodes = self._build_entry_forward_nodes(
             entry,
             score=best["score"],
             reason=best["reason"],
             near=near,
-            node_name=node_name,
+            node_name=entry.author,
             node_uin=node_uin,
         )
 
@@ -1154,14 +1163,15 @@ class DFHelperPlugin(Star):
         构造 /df 查询词的一级合并转发节点。
 
         最终只发送一条聊天记录：
-        - 节点 1：固定格式文字；
-        - 节点 2..N：按 JSON images 数组顺序发送图片；
-        - 最后：可能相关。
+        - 节点 1：文字说明；
+        - 节点 2..N：按 JSON images 数组顺序逐张发送图片；
+        - 节点名称：优先使用词条 author。
 
-        这里不返回普通消息链，不做二级嵌套。
+        注意：这里不把“可能相关”塞进命中的合并转发，避免查询成功后出现额外无关节点。
         """
         nodes: List[Dict[str, Any]] = []
         tag_text = f"｜{'、'.join(entry.tags)}" if entry.tags else ""
+        author_name = (entry.author or node_name or self.forward_node_name or "DF Helper").strip()
 
         body = (
             f"【DF 查询】{entry.title}{tag_text}\n"
@@ -1172,7 +1182,7 @@ class DFHelperPlugin(Star):
         nodes.append(
             self._make_node(
                 [{"type": "text", "data": {"text": body}}],
-                name=node_name,
+                name=author_name,
                 uin=node_uin,
             )
         )
@@ -1188,7 +1198,7 @@ class DFHelperPlugin(Star):
                 content = [
                     {"type": "text", "data": {"text": f"[图片缺失] {image}"}}
                 ]
-            nodes.append(self._make_node(content, name=node_name, uin=node_uin))
+            nodes.append(self._make_node(content, name=author_name, uin=node_uin))
 
         if self.max_images > 0 and len(entry.images) > self.max_images:
             nodes.append(
@@ -1201,23 +1211,11 @@ class DFHelperPlugin(Star):
                             },
                         }
                     ],
-                    name=node_name,
+                    name=author_name,
                     uin=node_uin,
                 )
             )
 
-        if near:
-            near_text = "可能相关：\n"
-            for item in near[:4]:
-                near_entry: DFEntry = item["entry"]
-                near_text += f"- {near_entry.title}（{item['score']}）\n"
-            nodes.append(
-                self._make_node(
-                    [{"type": "text", "data": {"text": near_text.strip()}}],
-                    name=node_name,
-                    uin=node_uin,
-                )
-            )
 
         return nodes
 
@@ -1669,13 +1667,13 @@ class DFHelperPlugin(Star):
         near: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """发送词条合并转发。"""
-        node_name, node_uin = await self._get_bot_forward_identity(event)
+        _, node_uin = await self._get_bot_forward_identity(event)
         nodes = self._build_entry_forward_nodes(
             entry,
             score,
             reason,
             near,
-            node_name=node_name,
+            node_name=entry.author,
             node_uin=node_uin,
         )
         return await self._send_onebot_forward(event, nodes)
