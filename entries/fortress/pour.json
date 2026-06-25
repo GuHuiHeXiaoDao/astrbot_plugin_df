@@ -1,0 +1,17 @@
+{
+  "id": "df_pour",
+  "title": "倾倒",
+  "author": "wiki原文,盗大盒灰骨讲解",
+  "keywords": [
+    "pour",
+    "倾倒",
+    "如何倒出岩浆"
+  ],
+  "tags": [
+    "教程",
+    "轨道"
+  ],
+  "answer": "第一步，获取一辆载有岩浆的矿车\n第二步,如图所示,①建立track stop并②设置倾动方向\n第三步,点击①的按键,进入轨道界面,点击②新增路线,点击③,将路线固定在刚刚设置的track stop,点击④，分配岩浆矿车\n可参考视频进行操作\n原理是track stop 会自动倾倒矿车,无论是液体还是物体,而利用route stop可以将矿车指定放置",
+  "images": ["pour_1.png","pour_2.png"],
+  "video_urls": ["https://www.bilibili.com/video/BV1eG411K71P"]
+}
